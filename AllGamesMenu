@@ -1,1 +1,65 @@
-JODFHUJS
+--[[
+    EXPANDER | MAIN SYSTEM
+    Universal Game Loader
+    Version: 1.0.0
+]]
+
+local Games = {
+    [85211729168715] = {
+        Name = "Blox Fruits - Sea 1",
+        Script = nil
+    },
+
+    [107778070777162] = {
+        Name = "Roube um Ovo",
+        Script = nil
+    },
+
+    [114326934417838] = {
+        Name = "Quebrar e Roubar um Ovo",
+        Script = nil
+    },
+
+    [79546208627805] = {
+        Name = "99 Noites na Floresta",
+        Script = nil
+    },
+
+    [109983668079237] = {
+        Name = "Roube um Brainrot",
+        Script = nil
+    }
+}
+
+local PlaceId = game.PlaceId
+local SelectedGame = Games[PlaceId]
+
+print("================================")
+print("       EXPANDER SYSTEM")
+print("================================")
+print("Place ID: " .. tostring(PlaceId))
+
+if not SelectedGame then
+    warn("[EXPANDER] Jogo não reconhecido!")
+    warn("[EXPANDER] Nenhum script foi executado.")
+    return
+end
+
+print("[EXPANDER] Jogo identificado: " .. SelectedGame.Name)
+
+if not SelectedGame.Script then
+    print("[EXPANDER] Script ainda não configurado.")
+    print("[EXPANDER] Aguardando o loadstring deste jogo.")
+    return
+end
+
+local Success, ErrorMessage = pcall(function()
+    SelectedGame.Script()
+end)
+
+if Success then
+    print("[EXPANDER] Script executado com sucesso!")
+else
+    warn("[EXPANDER] Erro ao executar o script:")
+    warn(tostring(ErrorMessage))
+end

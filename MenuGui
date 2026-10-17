@@ -1,0 +1,4949 @@
+-- ═══════════════════════════════════════════════════════════════════════
+-- EXPANDER UI — SCRIPT ÚNICO (biblioteca + interface pronta)
+--
+-- COMO USAR (executor, ex.: Xeon):
+--   1) copie este arquivo inteiro para um script novo;
+--   2) execute. A janela abre na hora.
+--   3) para fechar: X no canto ou getgenv().Expander:DestroyAll()
+-- Rodar de novo substitui a janela anterior (não empilha).
+--
+-- No Studio: cole num LocalScript (não precisa de ModuleScript nenhum).
+--
+-- TUDO está neste arquivo: utilitários, tema, estado, registro, componentes,
+-- janela, abas, seções, notificações, busca e o exemplo de uso no final.
+-- Versão: 1.0.0 · gerado por tools/build.py — não edite à mão.
+-- ═══════════════════════════════════════════════════════════════════════
+local MODULES = {}
+
+-- ── módulo: Signal (src/Utilities/Signal.lua) ────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- SIGNAL — emissor de eventos mínimo (sem dependências)
+--   local s = Signal.new()
+--   local conn = s:Connect(fn)   -- conn:Disconnect()
+--   s:Fire(...)                  -- dispara cópia segura da lista
+--   s:DisconnectAll()
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Signal"] = function(Env)
+	local Signal = {}
+	Signal.__index = Signal
+
+	function Signal.new()
+		return setmetatable({_handlers = {}, _count = 0}, Signal)
+	end
+
+	function Signal:Connect(fn)
+		assert(type(fn) == "function", "Signal:Connect espera uma função")
+		local entry = {fn = fn, alive = true}
+		table.insert(self._handlers, entry)
+		self._count = self._count + 1
+
+		local owner = self
+		local connection = {Connected = true}
+		function connection:Disconnect()
+			if not self.Connected then return end
+			self.Connected = false
+			entry.alive = false
+			for index = #owner._handlers, 1, -1 do
+				if owner._handlers[index] == entry then
+					table.remove(owner._handlers, index)
+					break
+				end
+			end
+		end
+		function connection:Fire(...)
+			owner:Fire(...)
+		end
+		return connection
+	end
+
+	function Signal:Fire(...)
+		-- cópia: um handler pode desconectar outro durante o disparo
+		local snapshot = {}
+		for index, entry in ipairs(self._handlers) do
+			snapshot[index] = entry
+		end
+		for _, entry in ipairs(snapshot) do
+			if entry.alive then
+				local ok, err = pcall(entry.fn, ...)
+				if not ok then
+					warn("[Expander] erro em listener: " .. tostring(err))
+				end
+			end
+		end
+	end
+
+	function Signal:DisconnectAll()
+		for _, entry in ipairs(self._handlers) do
+			entry.alive = false
+		end
+		self._handlers = {}
+		self._count = 0
+	end
+
+	function Signal:Count()
+		return #self._handlers
+	end
+
+	return Signal
+end
+
+-- ── módulo: Maid (src/Utilities/Maid.lua) ────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- MAID — limpeza determinística de tudo que um objeto cria
+--   maid:Add(instância | conexão | função | thread)
+--   maid:Clean()  /  maid:Destroy()
+-- Aceita qualquer coisa com método Destroy, Disconnect ou Cancel.
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Maid"] = function(Env)
+	local Maid = {}
+	Maid.__index = Maid
+
+	function Maid.new()
+		return setmetatable({_tasks = {}, _cleaning = false}, Maid)
+	end
+
+	local function release(item)
+		if item == nil then return end
+		local kind = typeof and typeof(item) or type(item)
+		if kind == "Instance" then
+			pcall(function() item:Destroy() end)
+		elseif kind == "RBXScriptConnection" or (type(item) == "table" and type(item.Disconnect) == "function") then
+			pcall(function() item:Disconnect() end)
+		elseif type(item) == "table" and type(item.Destroy) == "function" then
+			pcall(function() item:Destroy() end)
+		elseif type(item) == "table" and type(item.Clean) == "function" then
+			pcall(function() item:Clean() end)
+		elseif type(item) == "function" then
+			pcall(item)
+		elseif type(item) == "thread" then
+			pcall(function() coroutine.close(item) end)
+		end
+	end
+
+	function Maid:Add(item)
+		if item == nil then return item end
+		if self._cleaning then
+			release(item)
+			return item
+		end
+		table.insert(self._tasks, item)
+		return item
+	end
+
+	function Maid:Clean()
+		self._cleaning = true
+		local tasks = self._tasks
+		self._tasks = {}
+		for index = #tasks, 1, -1 do
+			release(tasks[index])
+			tasks[index] = nil
+		end
+		self._cleaning = false
+	end
+
+	Maid.Destroy = Maid.Clean
+	Maid.GiveTask = Maid.Add
+
+	return Maid
+end
+
+-- ── módulo: Layout (src/Utilities/Layout.lua) ────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- LAYOUT — criação de instâncias e utilidades visuais
+-- Tudo aqui é "burro": não conhece componentes, só facilita a vida.
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Layout"] = function(Env)
+	local U = {}
+
+	-- ── Serviços / ambiente ────────────────────────────────────────────
+	local TweenService = game:GetService("TweenService")
+	local RunService = game:GetService("RunService")
+
+	U.TweenService = TweenService
+	U.RunService = RunService
+
+	local okInput, userInput = pcall(function() return game:GetService("UserInputService") end)
+	U.UserInput = okInput and userInput or nil
+
+	-- task com fallback para ambientes 5.1 puros
+	local Task = task
+	if not Task then
+		Task = {
+			spawn = function(fn, ...)
+				local co = coroutine.create(fn)
+				coroutine.resume(co, ...)
+				return co
+			end,
+			delay = function(seconds, fn, ...)
+				local args = {...}
+				local co = coroutine.create(function()
+					if type(wait) == "function" then wait(seconds) end
+					fn(table.unpack(args))
+				end)
+				coroutine.resume(co)
+				return co
+			end,
+			wait = function(seconds)
+				if type(wait) == "function" then return wait(seconds) end
+				return 0
+			end,
+		}
+	end
+	U.Task = Task
+
+	if not table.unpack and unpack then table.unpack = unpack end
+	if not table.pack then table.pack = function(...) return {n = select("#", ...), ...} end end
+
+	-- ── Números ────────────────────────────────────────────────────────
+	function U.Clamp(value, low, high)
+		if value < low then return low end
+		if value > high then return high end
+		return value
+	end
+
+	function U.Round(value, step)
+		if not step or step <= 0 then return value end
+		return math.floor(value / step + 0.5) * step
+	end
+
+	function U.Lerp(a, b, alpha)
+		return a + (b - a) * alpha
+	end
+
+	function U.FormatNumber(value, decimals)
+		if decimals and decimals > 0 then
+			return string.format("%." .. tostring(decimals) .. "f", value)
+		end
+		return tostring(math.floor(value + 0.5))
+	end
+
+	-- ── Instâncias ─────────────────────────────────────────────────────
+	function U.New(class, props)
+		local instance = Instance.new(class)
+		if props then
+			local parent = nil
+			for key, value in pairs(props) do
+				if key == "Parent" then
+					parent = value
+				else
+					instance[key] = value
+				end
+			end
+			if parent then instance.Parent = parent end
+		end
+		return instance
+	end
+
+	function U.Corner(instance, radius)
+		return U.New("UICorner", {
+			CornerRadius = UDim.new(0, radius or 8),
+			Parent = instance,
+		})
+	end
+
+	function U.Stroke(instance, color, thickness, transparency)
+		return U.New("UIStroke", {
+			Color = color or Color3.fromRGB(40, 40, 60),
+			Thickness = thickness or 1,
+			Transparency = transparency or 0,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			Parent = instance,
+		})
+	end
+
+	function U.Gradient(instance, colorA, colorB, rotation)
+		return U.New("UIGradient", {
+			Color = ColorSequence.new(colorA, colorB),
+			Rotation = rotation or 0,
+			Parent = instance,
+		})
+	end
+
+	function U.Padding(instance, top, right, bottom, left)
+		return U.New("UIPadding", {
+			PaddingTop = UDim.new(0, top or 0),
+			PaddingRight = UDim.new(0, right or 0),
+			PaddingBottom = UDim.new(0, bottom or 0),
+			PaddingLeft = UDim.new(0, left or 0),
+			Parent = instance,
+		})
+	end
+
+	-- opts: Padding, Horizontal, Align, Order
+	function U.List(parent, opts)
+		opts = opts or {}
+		return U.New("UIListLayout", {
+			Padding = UDim.new(0, opts.Padding or 8),
+			FillDirection = opts.Horizontal and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical,
+			HorizontalAlignment = opts.Align or Enum.HorizontalAlignment.Left,
+			VerticalAlignment = opts.VerticalAlign or Enum.VerticalAlignment.Top,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Parent = parent,
+		})
+	end
+
+	-- TextLabel curto. opts: Font, Size, Color, X, Y, Align, Wrap, Truncate
+	function U.Label(parent, text, opts)
+		opts = opts or {}
+		return U.New("TextLabel", {
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Font = opts.Font or Enum.Font.Gotham,
+			TextSize = opts.Size or 12,
+			TextColor3 = opts.Color or Color3.new(1, 1, 1),
+			Text = text or "",
+			TextXAlignment = opts.Align or Enum.TextXAlignment.Left,
+			TextYAlignment = opts.VAlign or Enum.TextYAlignment.Center,
+			TextWrapped = opts.Wrap == true,
+			TextTruncate = opts.Truncate or Enum.TextTruncate.AtEnd,
+			RichText = false,
+			Parent = parent,
+		})
+	end
+
+	-- ── Animação ───────────────────────────────────────────────────────
+	-- Velocidade global: Theme.AnimSpeed (0 desliga animações)
+	U.AnimSpeed = 1
+
+	function U.Tween(instance, duration, props, style, direction)
+		if not instance then return nil end
+		local speed = U.AnimSpeed or 1
+		if speed <= 0 or not duration or duration <= 0 then
+			pcall(function()
+				for key, value in pairs(props or {}) do instance[key] = value end
+			end)
+			return nil
+		end
+		local info = TweenInfo.new(duration / speed, style or Enum.EasingStyle.Quad, direction or Enum.EasingDirection.Out)
+		local ok, tween = pcall(function()
+			return TweenService:Create(instance, info, props)
+		end)
+		if not ok or not tween then return nil end
+		tween:Play()
+		return tween
+	end
+
+	U.Delay = function(seconds, fn, ...)
+		return Task.delay(seconds, fn, ...)
+	end
+
+	U.Spawn = function(fn, ...)
+		return Task.spawn(fn, ...)
+	end
+
+	function U.Wait(seconds)
+		return Task.wait(seconds)
+	end
+
+	-- ── Chamadas seguras ──────────────────────────────────────────────
+	-- Nunca deixa um callback do usuário derrubar a interface.
+	function U.SafeCall(label, fn, ...)
+		if type(fn) ~= "function" then return false end
+		-- Os argumentos são capturados na closure: xpcall com varargs só
+		-- existe em Lua 5.2+, e o alvo aqui é 5.1/Roblox.
+		local args = {...}
+		local ok, err = xpcall(function()
+			return fn(table.unpack(args))
+		end, function(message)
+			return tostring(message) .. "\n" .. debug.traceback("", 2)
+		end)
+		if not ok then
+			warn("[Expander] erro em " .. tostring(label or "callback") .. ": " .. tostring(err))
+			U.LastError = tostring(err)
+			if U.OnError then
+				pcall(U.OnError, label, err)
+			end
+		end
+		return ok
+	end
+
+	-- ── Texto ──────────────────────────────────────────────────────────
+	function U.FormatClock(seconds)
+		seconds = math.max(0, math.floor(seconds or 0))
+		local hours = math.floor(seconds / 3600)
+		local minutes = math.floor((seconds % 3600) / 60)
+		local secs = seconds % 60
+		if hours > 0 then
+			return string.format("%02d:%02d:%02d", hours, minutes, secs)
+		end
+		return string.format("%02d:%02d", minutes, secs)
+	end
+
+	-- cor -> "#RRGGBB" (para documentação/notificações)
+	function U.Hex(color)
+		if not color then return "#000000" end
+		return string.format("#%02X%02X%02X",
+			math.floor(color.R * 255 + 0.5),
+			math.floor(color.G * 255 + 0.5),
+			math.floor(color.B * 255 + 0.5))
+	end
+
+	-- alfa visual: 0 = opaco, 1 = invisível
+	function U.Alpha(theme, base)
+		return U.Clamp(base + (theme.Transparency or 0), 0, 1)
+	end
+
+	return U
+end
+
+-- ── módulo: Icons (src/Utilities/Icons.lua) ──────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- ICONS — ícones desenhados com Frames (sem image id, nada para carregar)
+--   Env.Icons("home", color, 16) -> Frame
+-- Nomes: home, swords, combat, target, gear, bolt, shield, cart, user,
+--        list, info, star, close, minus, plus, chevron, check, search,
+--        bag, eye, chart, pin, skull, apple, diamond, dot
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Icons"] = function(Env)
+	local U = Env.Util
+
+	local function make(color, size)
+		local holder = U.New("Frame", {
+			Size = UDim2.fromOffset(size, size),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ClipsDescendants = false,
+		})
+		local function u(v) return math.max(1, math.floor(size * v + 0.5)) end
+		local function bar(cx, cy, w, h, rot, radius, col)
+			local frame = U.New("Frame", {
+				Size = UDim2.fromOffset(u(w), u(h)),
+				Position = UDim2.fromOffset(u(cx), u(cy)),
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				BackgroundColor3 = col or color,
+				BorderSizePixel = 0,
+				Rotation = rot or 0,
+				Parent = holder,
+			})
+			if radius then U.Corner(frame, radius) end
+			return frame
+		end
+		local function ring(cx, cy, w, h, thickness)
+			local frame = U.New("Frame", {
+				Size = UDim2.fromOffset(u(w), u(h)),
+				Position = UDim2.fromOffset(u(cx), u(cy)),
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				Parent = holder,
+			})
+			U.Corner(frame, math.floor(size))
+			U.Stroke(frame, color, thickness or math.max(1, size * 0.09), 0)
+			return frame
+		end
+		local function disc(cx, cy, w, col)
+			local frame = U.New("Frame", {
+				Size = UDim2.fromOffset(u(w), u(w)),
+				Position = UDim2.fromOffset(u(cx), u(cy)),
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				BackgroundColor3 = col or color,
+				BorderSizePixel = 0,
+				Parent = holder,
+			})
+			U.Corner(frame, math.floor(size))
+			return frame
+		end
+
+		return holder, bar, ring, disc
+	end
+
+	local DRAW = {}
+
+	DRAW.home = function(bar, ring, disc)
+		bar(0.5, 0.70, 0.62, 0.40, 0, 2)
+		bar(0.5, 0.36, 0.66, 0.11, 0, 2)
+		bar(0.5, 0.20, 0.34, 0.10, 0, 2)
+	end
+	DRAW.swords = function(bar)
+		for _, rot in ipairs({-42, 42}) do
+			bar(0.5, 0.36, 0.80, 0.10, rot, 1)
+			bar(0.5 + (rot < 0 and 0.12 or -0.12), 0.78, 0.10, 0.26, rot, 1)
+			bar(0.5 + (rot < 0 and 0.09 or -0.09), 0.66, 0.26, 0.09, rot + 90, 1)
+		end
+	end
+	DRAW.combat = function(bar, ring, disc)
+		ring(0.5, 0.5, 0.62, 0.62, 1.4)
+		bar(0.5, 0.12, 0.07, 0.22)
+		bar(0.5, 0.88, 0.07, 0.22)
+		bar(0.12, 0.5, 0.22, 0.07)
+		bar(0.88, 0.5, 0.22, 0.07)
+	end
+	DRAW.target = DRAW.combat
+	DRAW.gear = function(bar, ring)
+		ring(0.5, 0.5, 0.56, 0.56, 1.5)
+		bar(0.5, 0.08, 0.12, 0.20)
+		bar(0.5, 0.92, 0.12, 0.20)
+		bar(0.08, 0.5, 0.20, 0.12)
+		bar(0.92, 0.5, 0.20, 0.12)
+	end
+	DRAW.bolt = function(bar)
+		bar(0.46, 0.34, 0.16, 0.44, 22, 1)
+		bar(0.54, 0.66, 0.16, 0.44, 22, 1)
+	end
+	DRAW.shield = function(bar)
+		bar(0.5, 0.42, 0.60, 0.46, 0, 2)
+		bar(0.5, 0.72, 0.40, 0.40, 45, 1)
+	end
+	DRAW.cart = function(bar, ring, disc)
+		bar(0.5, 0.58, 0.62, 0.30, 0, 2)
+		bar(0.24, 0.36, 0.34, 0.09, -28, 1)
+		disc(0.32, 0.80, 0.16)
+		disc(0.68, 0.80, 0.16)
+	end
+	DRAW.bag = function(bar, ring)
+		bar(0.5, 0.60, 0.70, 0.50, 0, 3)
+		ring(0.5, 0.32, 0.36, 0.30, 1.3)
+	end
+	DRAW.user = function(bar, ring, disc)
+		disc(0.5, 0.34, 0.36)
+		bar(0.5, 0.74, 0.66, 0.40, 0, 4)
+	end
+	DRAW.list = function(bar)
+		bar(0.5, 0.24, 0.70, 0.10, 0, 1)
+		bar(0.5, 0.50, 0.70, 0.10, 0, 1)
+		bar(0.5, 0.76, 0.70, 0.10, 0, 1)
+	end
+	DRAW.info = function(bar, ring, disc)
+		ring(0.5, 0.5, 0.72, 0.72, 1.4)
+		disc(0.5, 0.30, 0.09)
+		bar(0.5, 0.60, 0.08, 0.30, 0, 1)
+	end
+	DRAW.star = function(bar, ring, disc)
+		disc(0.5, 0.5, 0.34)
+		bar(0.5, 0.12, 0.10, 0.26)
+		bar(0.5, 0.88, 0.10, 0.26)
+		bar(0.12, 0.5, 0.26, 0.10)
+		bar(0.88, 0.5, 0.26, 0.10)
+	end
+	DRAW.close = function(bar)
+		bar(0.5, 0.5, 0.62, 0.11, 45, 1)
+		bar(0.5, 0.5, 0.62, 0.11, -45, 1)
+	end
+	DRAW.minus = function(bar)
+		bar(0.5, 0.5, 0.56, 0.11, 0, 1)
+	end
+	DRAW.plus = function(bar)
+		bar(0.5, 0.5, 0.56, 0.11, 0, 1)
+		bar(0.5, 0.5, 0.11, 0.56, 0, 1)
+	end
+	DRAW.chevron = function(bar)
+		bar(0.38, 0.50, 0.34, 0.09, 45, 1)
+		bar(0.62, 0.50, 0.34, 0.09, -45, 1)
+	end
+	DRAW.check = function(bar)
+		bar(0.40, 0.58, 0.44, 0.10, 45, 1)
+		bar(0.68, 0.42, 0.44, 0.10, -45, 1)
+	end
+	DRAW.search = function(bar, ring)
+		ring(0.44, 0.44, 0.62, 0.62, 1.4)
+		bar(0.76, 0.76, 0.32, 0.10, 45, 1)
+	end
+	DRAW.eye = function(bar, ring, disc)
+		ring(0.5, 0.5, 0.88, 0.52, 1.4)
+		disc(0.5, 0.5, 0.22)
+	end
+	DRAW.chart = function(bar)
+		bar(0.22, 0.68, 0.16, 0.40, 0, 1)
+		bar(0.50, 0.52, 0.16, 0.72, 0, 1)
+		bar(0.78, 0.36, 0.16, 1.04, 0, 1)
+	end
+	DRAW.pin = function(bar, ring, disc)
+		disc(0.5, 0.42, 0.56)
+		bar(0.5, 0.78, 0.34, 0.34, 45, 1)
+		disc(0.5, 0.42, 0.20, nil)
+	end
+	DRAW.skull = function(bar, ring, disc)
+		disc(0.5, 0.44, 0.62)
+		bar(0.5, 0.78, 0.30, 0.16, 0, 2)
+	end
+	DRAW.apple = function(bar, ring, disc)
+		disc(0.5, 0.60, 0.58)
+		bar(0.52, 0.20, 0.08, 0.22, 8, 1)
+		bar(0.66, 0.24, 0.24, 0.09, -32, 1)
+	end
+	DRAW.diamond = function(bar)
+		bar(0.5, 0.5, 0.58, 0.58, 45, 2)
+	end
+	DRAW.dot = function(bar, ring, disc)
+		disc(0.5, 0.5, 0.5)
+	end
+
+	local function draw(kind, color, size)
+		local holder, bar, ring, disc = make(color or Color3.new(1, 1, 1), size or 16)
+		local painter = DRAW[kind]
+		if not painter then
+			warn("[Expander] ícone desconhecido: " .. tostring(kind) .. " (usei 'dot')")
+			painter = DRAW.dot
+		end
+		local ok, err = pcall(painter, bar, ring, disc)
+		if not ok then
+			warn("[Expander] falha ao desenhar ícone '" .. tostring(kind) .. "': " .. tostring(err))
+		end
+		return holder
+	end
+
+	local names = {}
+	for name in pairs(DRAW) do table.insert(names, name) end
+	table.sort(names)
+
+	-- tabela chamável: Env.Icons("home", color, 16) e Env.Icons.Names
+	local Icons = setmetatable({Names = names}, {
+		__call = function(_, kind, color, size)
+			return draw(kind, color, size)
+		end,
+	})
+
+	return Icons
+end
+
+-- ── módulo: ThemeManager (src/ThemeManager.lua) ──────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- THEME MANAGER — paletas, troca em tempo real e velocidade de animação
+--
+--   local theme = Theme.new("Purple")
+--   theme:Get()                 -- tabela de cores atual (somente leitura)
+--   theme:Set("Cyan")           -- troca a paleta inteira
+--   theme:SetAccent(Color3)     -- troca só o destaque
+--   theme:SetTransparency(0.1)  -- 0 = sólido, 1 = transparente
+--   theme:SetAnimSpeed(1.5)     -- 0 desliga animações
+--   local conn = theme:OnChanged(function(palette) end)
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["ThemeManager"] = function(Env)
+	local Signal = Env.Signal
+
+	local function rgb(hex)
+		return Color3.fromHex(hex)
+	end
+
+	local THEMES = {
+		Purple = {
+			Accent = rgb("#6A3DF5"), AccentSoft = rgb("#4C2A8F"), AccentDeep = rgb("#361BB0"),
+			AccentGlow = rgb("#7B4BFF"),
+			Bg = rgb("#05070F"), Panel = rgb("#080D18"), Card = rgb("#0A1020"), CardHover = rgb("#101830"),
+			Border = rgb("#1F1B42"), BorderSoft = rgb("#14122E"),
+			Text = rgb("#FFFFFF"), Dim = rgb("#9BA1C0"), Muted = rgb("#6A7093"),
+			Good = rgb("#1DDCA5"), Warn = rgb("#FBBF24"), Bad = rgb("#FB7185"),
+		},
+		Midnight = {
+			Accent = rgb("#3B82F6"), AccentSoft = rgb("#1E3A8A"), AccentDeep = rgb("#1D4ED8"),
+			AccentGlow = rgb("#60A5FA"),
+			Bg = rgb("#03060D"), Panel = rgb("#070C16"), Card = rgb("#0A1220"), CardHover = rgb("#101B2E"),
+			Border = rgb("#16233F"), BorderSoft = rgb("#101A2E"),
+			Text = rgb("#F5F8FF"), Dim = rgb("#93A3C0"), Muted = rgb("#5F6F8C"),
+			Good = rgb("#22D3EE"), Warn = rgb("#FBBF24"), Bad = rgb("#FB7185"),
+		},
+		Cyan = {
+			Accent = rgb("#22D3EE"), AccentSoft = rgb("#0E6E7C"), AccentDeep = rgb("#0891B2"),
+			AccentGlow = rgb("#67E8F9"),
+			Bg = rgb("#04090B"), Panel = rgb("#071014"), Card = rgb("#0A161B"), CardHover = rgb("#0F2027"),
+			Border = rgb("#143038"), BorderSoft = rgb("#0E2229"),
+			Text = rgb("#F0FEFF"), Dim = rgb("#8FB3BC"), Muted = rgb("#5C7A82"),
+			Good = rgb("#34D399"), Warn = rgb("#FBBF24"), Bad = rgb("#FB7185"),
+		},
+		Rose = {
+			Accent = rgb("#F43F5E"), AccentSoft = rgb("#7F1D2E"), AccentDeep = rgb("#BE123C"),
+			AccentGlow = rgb("#FB7185"),
+			Bg = rgb("#0A0407"), Panel = rgb("#12070C"), Card = rgb("#180A11"), CardHover = rgb("#221019"),
+			Border = rgb("#3B1622"), BorderSoft = rgb("#2A0F19"),
+			Text = rgb("#FFF5F7"), Dim = rgb("#C09AA4"), Muted = rgb("#8A6A73"),
+			Good = rgb("#34D399"), Warn = rgb("#FBBF24"), Bad = rgb("#FB7185"),
+		},
+		Emerald = {
+			Accent = rgb("#10B981"), AccentSoft = rgb("#065F46"), AccentDeep = rgb("#047857"),
+			AccentGlow = rgb("#34D399"),
+			Bg = rgb("#030A07"), Panel = rgb("#06120D"), Card = rgb("#081A13"), CardHover = rgb("#0D2419"),
+			Border = rgb("#123227"), BorderSoft = rgb("#0C241B"),
+			Text = rgb("#F2FFF9"), Dim = rgb("#8FB8A7"), Muted = rgb("#5C7D6F"),
+			Good = rgb("#34D399"), Warn = rgb("#FBBF24"), Bad = rgb("#FB7185"),
+		},
+		Mono = {
+			Accent = rgb("#E5E7EB"), AccentSoft = rgb("#4B5563"), AccentDeep = rgb("#9CA3AF"),
+			AccentGlow = rgb("#F9FAFB"),
+			Bg = rgb("#060607"), Panel = rgb("#0C0D0F"), Card = rgb("#121316"), CardHover = rgb("#1A1C20"),
+			Border = rgb("#2A2D33"), BorderSoft = rgb("#1E2126"),
+			Text = rgb("#FFFFFF"), Dim = rgb("#A1A6B0"), Muted = rgb("#6B7078"),
+			Good = rgb("#34D399"), Warn = rgb("#FBBF24"), Bad = rgb("#FB7185"),
+		},
+	}
+
+	local Theme = {}
+	Theme.__index = Theme
+	Theme.Themes = THEMES
+	Theme.ThemeNames = {"Purple", "Midnight", "Cyan", "Rose", "Emerald", "Mono"}
+
+	local function copy(source)
+		local out = {}
+		for key, value in pairs(source) do out[key] = value end
+		-- chaves derivadas (existem em todos os temas)
+		out.Off = out.Off or out.CardHover
+		out.White = out.White or Color3.new(1, 1, 1)
+		out.Transparency = out.Transparency or 0
+		return out
+	end
+
+	function Theme.new(defaultName)
+		local palette = copy(THEMES[defaultName or "Purple"] or THEMES.Purple)
+		local self = setmetatable({
+			_name = THEMES[defaultName] and defaultName or "Purple",
+			_palette = palette,
+			_changed = Signal.new(),
+			Transparency = 0,
+			AnimSpeed = 1,
+		}, Theme)
+		return self
+	end
+
+	function Theme:Get()
+		return self._palette
+	end
+
+	function Theme:Name()
+		return self._name
+	end
+
+	function Theme:Names()
+		return Theme.ThemeNames
+	end
+
+	function Theme:Set(name)
+		local base = THEMES[name]
+		if not base then return false end
+		-- preserva transparência e velocidade configuradas
+		self._palette = copy(base)
+		self._palette.Transparency = self.Transparency
+		self._name = name
+		self._changed:Fire(self._palette, name)
+		return true
+	end
+
+	function Theme:SetAccent(color)
+		if typeof and typeof(color) ~= "Color3" then return false end
+		if type(color) ~= "userdata" and type(color) ~= "table" then return false end
+		self._palette.Accent = color
+		-- deriva os tons sem depender de Color3:Lerp (existe, mas é lento)
+		local r, g, b = color.R, color.G, color.B
+		self._palette.AccentDeep = Color3.new(r * 0.55, g * 0.55, b * 0.55)
+		self._palette.AccentSoft = Color3.new(r * 0.72, g * 0.72, b * 0.72)
+		self._palette.AccentGlow = Color3.new(math.min(1, r * 1.15), math.min(1, g * 1.15), math.min(1, b * 1.15))
+		self._changed:Fire(self._palette, self._name)
+		return true
+	end
+
+	function Theme:SetTransparency(value)
+		self.Transparency = Env.Util.Clamp(tonumber(value) or 0, 0, 0.9)
+		self._palette.Transparency = self.Transparency
+		self._changed:Fire(self._palette, self._name)
+	end
+
+	function Theme:SetAnimSpeed(value)
+		self.AnimSpeed = math.max(0, tonumber(value) or 1)
+		Env.Util.AnimSpeed = self.AnimSpeed
+	end
+
+	function Theme:OnChanged(fn)
+		return self._changed:Connect(fn)
+	end
+
+	return Theme
+end
+
+-- ── módulo: StateManager (src/StateManager.lua) ──────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- STATE MANAGER — valores nomeados, observáveis e tipados
+--
+--   local state = State.new()
+--   state:Set("autoFarm", true)
+--   state:Get("autoFarm")            --> true
+--   state:Watch("autoFarm", fn)      --> conexão
+--   state:Toggle("autoFarm")
+--   state:Snapshot()                 --> cópia de tudo
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["StateManager"] = function(Env)
+	local Signal = Env.Signal
+
+	local State = {}
+	State.__index = State
+
+	function State.new(initial)
+		local self = setmetatable({
+			_values = {},
+			_defaults = {},
+			_watchers = {},
+			_changed = Signal.new(),
+		}, State)
+
+		if type(initial) == "table" then
+			for key, value in pairs(initial) do
+				self._values[key] = value
+				self._defaults[key] = value
+			end
+		end
+		return self
+	end
+
+	function State:Set(key, value, silent)
+		assert(type(key) == "string" and key ~= "", "State:Set precisa de uma chave de texto")
+		local previous = self._values[key]
+		self._values[key] = value
+		if not silent then
+			local list = self._watchers[key]
+			if list then
+				for index = #list, 1, -1 do
+					if list[index] then
+						local ok, err = pcall(list[index].fn, value, previous)
+						if not ok then
+							warn("[Expander] erro em watcher de '" .. key .. "': " .. tostring(err))
+						end
+					end
+				end
+			end
+			self._changed:Fire(key, value, previous)
+		end
+		return value
+	end
+
+	function State:Get(key, fallback)
+		local value = self._values[key]
+		if value == nil then return fallback end
+		return value
+	end
+
+	function State:Has(key)
+		return self._values[key] ~= nil
+	end
+
+	function State:Toggle(key)
+		return self:Set(key, not self:Get(key))
+	end
+
+	function State:Watch(key, fn)
+		self._watchers[key] = self._watchers[key] or {}
+		local entry = {fn = fn, alive = true}
+		table.insert(self._watchers[key], entry)
+
+		local owner = self
+		local connection = {Connected = true}
+		function connection:Disconnect()
+			if not self.Connected then return end
+			self.Connected = false
+			entry.alive = false
+			local list = owner._watchers[key]
+			for index = #list, 1, -1 do
+				if list[index] == entry then table.remove(list, index) break end
+			end
+		end
+		return connection
+	end
+
+	function State:OnChanged(fn)
+		return self._changed:Connect(fn)
+	end
+
+	function State:Snapshot()
+		local out = {}
+		for key, value in pairs(self._values) do out[key] = value end
+		return out
+	end
+
+	function State:Reset()
+		self._values = {}
+		for key, value in pairs(self._defaults) do self._values[key] = value end
+		self._changed:Fire(nil, nil, nil)
+	end
+
+	return State
+end
+
+-- ── módulo: ComponentRegistry (src/ComponentRegistry.lua) ────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- COMPONENT REGISTRY — índice de tudo que existe na janela
+-- Usado pela busca e por DestroyAll. Cada componente entra ao ser criado
+-- e sai ao ser destruído, sem duplicar entradas.
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["ComponentRegistry"] = function(Env)
+	local Signal = Env.Signal
+
+	local Registry = {}
+	Registry.__index = Registry
+
+	function Registry.new()
+		return setmetatable({
+			_entries = {},
+			_byId = {},
+			_changed = Signal.new(),
+			_nextId = 0,
+		}, Registry)
+	end
+
+	function Registry:Add(component, meta)
+		self._nextId = self._nextId + 1
+		local id = "cmp_" .. tostring(self._nextId)
+		local entry = {
+			id = id,
+			component = component,
+			name = meta.name or "",
+			description = meta.description or "",
+			kind = meta.kind or "Component",
+			tab = meta.tab,
+			section = meta.section,
+			searchText = string.lower((meta.name or "") .. " " .. (meta.description or "") .. " " .. (meta.kind or "")),
+		}
+		table.insert(self._entries, entry)
+		self._byId[id] = entry
+		self._changed:Fire(#self._entries)
+		return id
+	end
+
+	function Registry:Remove(id)
+		if not id or not self._byId[id] then return end
+		self._byId[id] = nil
+		for index = #self._entries, 1, -1 do
+			if self._entries[index].id == id then
+				table.remove(self._entries, index)
+				break
+			end
+		end
+		self._changed:Fire(#self._entries)
+	end
+
+	function Registry:Count()
+		return #self._entries
+	end
+
+	function Registry:All()
+		return self._entries
+	end
+
+	-- Busca por nome/descrição/tipo. Devolve lista de entradas (até limit).
+	function Registry:Search(query, limit)
+		query = string.lower(tostring(query or ""))
+		if query == "" then return {} end
+		local results = {}
+		for _, entry in ipairs(self._entries) do
+			if string.find(entry.searchText, query, 1, true) then
+				table.insert(results, entry)
+				if limit and #results >= limit then break end
+			end
+		end
+		return results
+	end
+
+	function Registry:OnChanged(fn)
+		return self._changed:Connect(fn)
+	end
+
+	function Registry:Clear()
+		self._entries = {}
+		self._byId = {}
+		self._changed:Fire(0)
+	end
+
+	return Registry
+end
+
+-- ── módulo: Support (src/Components/Support.lua) ─────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- SUPPORT — peças comuns a todos os componentes
+-- (linha, título, descrição, hover, vínculo com o tema)
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Support"] = function(Env)
+	local U = Env.Util
+	local Support = {}
+
+	function Support.Row(parent, height, opts)
+		opts = opts or {}
+		local palette = Env.Theme:Get()
+		local row = U.New("Frame", {
+			Size = UDim2.new(1, 0, 0, height or 44),
+			BackgroundColor3 = palette.Card,
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ClipsDescendants = false,
+			Parent = parent,
+		})
+		U.Corner(row, 8)
+		if opts.Hover ~= false then
+			row.MouseEnter:Connect(function()
+				U.Tween(row, 0.12, {BackgroundTransparency = 0.55})
+			end)
+			row.MouseLeave:Connect(function()
+				U.Tween(row, 0.12, {BackgroundTransparency = 1})
+			end)
+		end
+		return row
+	end
+
+	-- Título + descrição dentro da linha. Devolve os dois labels.
+	function Support.Title(row, name, description, rightPad, topPad)
+		local palette = Env.Theme:Get()
+		local pad = rightPad or 60
+		local top = topPad or 8
+		local title = U.Label(row, name or "", {
+			Font = Enum.Font.GothamMedium,
+			Size = 12,
+			Color = palette.Text,
+		})
+		title.Size = UDim2.new(1, -pad, 0, 16)
+		title.Position = UDim2.fromOffset(10, top)
+
+		local desc = nil
+		if description and description ~= "" then
+			desc = U.Label(row, description, {
+				Font = Enum.Font.Gotham,
+				Size = 10,
+				Color = palette.Muted,
+			})
+			desc.Size = UDim2.new(1, -pad, 0, 14)
+			desc.Position = UDim2.fromOffset(10, top + 16)
+		end
+
+		local function paint(themePalette)
+			title.TextColor3 = themePalette.Text
+			if desc then desc.TextColor3 = themePalette.Muted end
+		end
+		return title, desc, paint
+	end
+
+	function Support.RowPaint(row, palette, hovered)
+		row.BackgroundColor3 = hovered and palette.CardHover or palette.Card
+	end
+
+	-- Liga o componente ao tema: chama painter(palette) agora e a cada troca.
+	function Support.BindTheme(comp, painter)
+		comp.Maid:Add(Env.Theme:OnChanged(function(palette)
+			pcall(painter, palette)
+			if comp.RefreshDim then pcall(comp.RefreshDim, comp) end
+		end))
+		local ok, err = pcall(painter, Env.Theme:Get())
+		if not ok then
+			warn("[Expander] falha ao pintar " .. tostring(comp.Type) .. ": " .. tostring(err))
+		end
+	end
+
+	function Support.MakeComponent(meta)
+		local comp = {
+			Type = meta.kind or "Component",
+			Name = meta.name or "",
+			Description = meta.description or "",
+			Row = meta.row,
+			Maid = Env.Maid.new(),
+			Visible = true,
+			Enabled = meta.enabled ~= false,
+			Destroyed = false,
+			_Dim = {},
+			_DimBase = {},
+		}
+
+		-- Registra um objeto que escurece junto com o componente. Guardamos a
+		-- transparência original para poder restaurar exatamente como era.
+		function comp:AddDim(object)
+			if not object or self._DimBase[object] then return end
+			local base = {background = object.BackgroundTransparency, text = nil}
+			if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+				base.text = object.TextTransparency
+			end
+			self._DimBase[object] = base
+			table.insert(self._Dim, object)
+		end
+
+		-- Reaplica o "escurecido" DEPOIS do Paint, senão a pintura do tema
+		-- sobrescreve a transparência e o componente desativado parece ativo.
+		function comp:RefreshDim()
+			if self.Destroyed then return end
+			for _, object in ipairs(self._Dim) do
+				local base = self._DimBase[object]
+				if base then
+					if self.Enabled then
+						object.BackgroundTransparency = base.background
+						if base.text ~= nil then object.TextTransparency = base.text end
+					else
+						base.background = object.BackgroundTransparency
+						object.BackgroundTransparency = math.min(1, base.background + 0.4)
+						if base.text ~= nil then
+							base.text = object.TextTransparency
+							object.TextTransparency = math.min(1, base.text + 0.35)
+						end
+					end
+				end
+			end
+		end
+
+		function comp:SetEnabled(value)
+			value = value ~= false
+			if self.Enabled == value then return value end
+			self.Enabled = value
+			if self.ApplyEnabled then pcall(self.ApplyEnabled, self, value) end
+			if self.Paint then pcall(self.Paint, self, Env.Theme:Get()) end
+			self:RefreshDim()
+			return value
+		end
+
+		function comp:IsEnabled()
+			return self.Enabled == true
+		end
+
+		return comp
+	end
+
+	-- Botão transparente que cobre a linha (área de clique). Recebe o comp
+	-- para registrar a conexão no Maid.
+	function Support.ClickArea(comp, row)
+		local area = U.New("TextButton", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Text = "",
+			AutoButtonColor = false,
+			ZIndex = row.ZIndex + 1,
+			Parent = row,
+		})
+		comp.Maid:Add(area.MouseButton1Click:Connect(function()
+			if comp.Enabled == false or comp.Destroyed then return end
+			if comp.OnClick then comp:OnClick() end
+		end))
+		return area
+	end
+
+	return Support
+end
+
+-- ── módulo: Notifications (src/Notifications.lua) ────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- NOTIFICATIONS — toasts empilhados no canto superior direito
+--   local notifier = Notifications.new(parentFrame, theme)
+--   notifier:Push({Title = "...", Content = "...", Duration = 4, Type = "info"})
+--   notifier:Clear()
+-- Tipos: info | success | warn | error
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Notifications"] = function(Env)
+	local U = Env.Util
+
+	local Notifications = {}
+	Notifications.__index = Notifications
+
+	local TYPE_COLOR = function(palette, kind)
+		if kind == "success" then return palette.Good end
+		if kind == "warn" then return palette.Warn end
+		if kind == "error" then return palette.Bad end
+		return palette.Accent
+	end
+
+	function Notifications.new(parent, width)
+		local palette = Env.Theme:Get()
+		local holder = U.New("Frame", {
+			Name = "Notifications",
+			Size = UDim2.fromOffset(width or 300, 420),
+			Position = UDim2.new(1, -16, 0, 76),
+			AnchorPoint = Vector2.new(1, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ClipsDescendants = false,
+			ZIndex = 400,
+			Parent = parent,
+		})
+		U.List(holder, {Padding = 8, Align = Enum.HorizontalAlignment.Right})
+		local self = setmetatable({
+			Holder = holder,
+			Width = width or 300,
+			Maid = Env.Maid.new(),
+			Items = {},
+			Order = 0,
+			Palette = palette,
+		}, Notifications)
+
+		-- notificações visíveis acompanham a troca de tema
+		self.Maid:Add(Env.Theme:OnChanged(function(nextPalette)
+			for _, item in ipairs(self.Items) do
+				if item.Paint then pcall(item.Paint, nextPalette) end
+			end
+		end))
+
+		return self
+	end
+
+	function Notifications:Push(config)
+		config = config or {}
+		local theme = Env.Theme:Get()
+		local duration = tonumber(config.Duration) or 4
+		self.Order = self.Order + 1
+
+		local card = U.New("Frame", {
+			Size = UDim2.new(0, self.Width, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundColor3 = theme.Card,
+			BackgroundTransparency = U.Alpha(theme, 0),
+			BorderSizePixel = 0,
+			ClipsDescendants = true,
+			LayoutOrder = self.Order,
+			ZIndex = 401,
+			Parent = self.Holder,
+		})
+		U.Corner(card, 10)
+		local stroke = U.Stroke(card, theme.Border, 1, 0.1)
+		U.Padding(card, 12, 12, 12, 16)
+
+		local accent = U.New("Frame", {
+			Size = UDim2.new(0, 3, 1, -16),
+			Position = UDim2.fromOffset(7, 8),
+			BackgroundColor3 = TYPE_COLOR(theme, config.Type),
+			BorderSizePixel = 0,
+			ZIndex = 402,
+			Parent = card,
+		})
+		U.Corner(accent, 2)
+
+		local title = U.Label(card, config.Title or "Aviso", {
+			Font = Enum.Font.GothamBold,
+			Size = 12,
+			Color = theme.Text,
+		})
+		title.Size = UDim2.new(1, 0, 0, 16)
+		title.ZIndex = 402
+
+		local body = U.Label(card, config.Content or "", {
+			Font = Enum.Font.Gotham,
+			Size = 10,
+			Color = theme.Dim,
+			Wrap = true,
+			Truncate = Enum.TextTruncate.None,
+		})
+		body.Size = UDim2.new(1, 0, 0, 0)
+		body.AutomaticSize = Enum.AutomaticSize.Y
+		body.ZIndex = 402
+
+		local spacing = U.New("Frame", {
+			Size = UDim2.new(1, 0, 0, 0),
+			BackgroundTransparency = 1,
+			Parent = card,
+		})
+		spacing.AutomaticSize = Enum.AutomaticSize.Y
+		spacing.ZIndex = 402
+		U.List(spacing, {Padding = 2})
+		title.Parent = spacing
+		body.Parent = spacing
+
+		local item = {Card = card, Closed = false}
+		item.Paint = function(palette)
+			if item.Closed then return end
+			card.BackgroundColor3 = palette.Card
+			stroke.Color = palette.Border
+			title.TextColor3 = palette.Text
+			body.TextColor3 = palette.Dim
+			accent.BackgroundColor3 = TYPE_COLOR(palette, config.Type)
+		end
+		table.insert(self.Items, item)
+
+		local function close()
+			if item.Closed then return end
+			item.Closed = true
+			U.Tween(card, 0.16, {BackgroundTransparency = 1}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			U.Tween(spacing, 0.16, {Position = UDim2.fromOffset(12, 0)})
+			U.Delay(0.18, function()
+				if card then card:Destroy() end
+				for index = #self.Items, 1, -1 do
+					if self.Items[index] == item then table.remove(self.Items, index) end
+				end
+			end)
+		end
+		item.Close = close
+
+		card.BackgroundTransparency = 1
+		card.Position = UDim2.fromOffset(self.Width, 0)
+		U.Tween(card, 0.22, {
+			BackgroundTransparency = 0,
+			Position = UDim2.fromOffset(0, 0),
+		})
+
+		-- fechar ao clicar no cartão
+		local closeArea = U.New("TextButton", {
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			Text = "",
+			ZIndex = 405,
+			Parent = card,
+		})
+		closeArea.MouseButton1Click:Connect(close)
+
+		if duration > 0 then
+			U.Delay(duration, close)
+		end
+
+		-- limite de 5 visíveis
+		while #self.Items > 5 do
+			local oldest = table.remove(self.Items, 1)
+			if oldest and oldest.Close then oldest.Close() end
+		end
+
+		return item
+	end
+
+	function Notifications:Clear()
+		local items = self.Items
+		self.Items = {}
+		for _, item in ipairs(items) do
+			if item.Close then item.Close() end
+		end
+	end
+
+	function Notifications:Destroy()
+		self:Clear()
+		if self.Holder then self.Holder:Destroy() end
+		self.Maid:Clean()
+	end
+
+	return Notifications
+end
+
+-- ── módulo: Button (src/Components/Button.lua) ───────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- BUTTON
+--   Section:CreateButton({Name, Description, Icon, Style, Callback, Disabled})
+--   :SetText(text) · :SetDisabled(bool) · :Click() · :Destroy()
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Button"] = function(Env)
+	local U = Env.Util
+	local Support = Env.Components.Support
+
+	local Button = {}
+	Button.__index = Button
+	Button.__typename = "Button"
+
+	function Button.new(section, config)
+		config = config or {}
+		local hasDesc = type(config.Description) == "string" and config.Description ~= ""
+		local comp = setmetatable(Support.MakeComponent({
+			kind = "Button",
+			name = config.Name or "Botão",
+			description = config.Description,
+			row = nil,
+		}), Button)
+
+		comp.Callback = config.Callback
+		comp.Style = config.Style or "ghost"
+		comp.Disabled = config.Disabled == true
+
+		local row = Support.Row(section.Content, hasDesc and 58 or 46, {Hover = false})
+		comp.Row = row
+
+		local surface = U.New("TextButton", {
+			Size = UDim2.new(1, 0, 1, 0),
+			BackgroundColor3 = Env.Theme:Get().Card,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Text = "",
+			Parent = row,
+		})
+		U.Corner(surface, 8)
+		local surfaceStroke = U.Stroke(surface, Env.Theme:Get().Border, 1, 0.1)
+		comp.Surface = surface
+
+		local title = U.Label(surface, config.Name or "Botão", {
+			Font = Enum.Font.GothamBold,
+			Size = 12,
+			Color = Env.Theme:Get().Text,
+			Align = Enum.TextXAlignment.Center,
+		})
+		title.Size = UDim2.new(1, -20, 0, hasDesc and 16 or 0)
+		title.Position = UDim2.new(0, 10, 0.5, hasDesc and -8 or 0)
+		title.AnchorPoint = Vector2.new(0, 0.5)
+		comp.Title = title
+
+		local desc = nil
+		if hasDesc then
+			desc = U.Label(surface, config.Description, {
+				Font = Enum.Font.Gotham,
+				Size = 9,
+				Color = Env.Theme:Get().Muted,
+				Align = Enum.TextXAlignment.Center,
+			})
+			desc.Size = UDim2.new(1, -20, 0, 12)
+			desc.Position = UDim2.new(0, 10, 0.5, 7)
+			comp.Desc = desc
+		end
+
+		local icon = nil
+		if config.Icon then
+			icon = Env.Icons(config.Icon, Env.Theme:Get().AccentGlow, 14)
+			icon.Position = UDim2.new(0.5, -title.TextBounds.X / 2 - 20, 0.5, -7)
+			icon.Parent = surface
+			comp.Icon = icon
+		end
+
+		-- posiciona o ícone à esquerda do texto centralizado
+		local function placeIcon()
+			if not icon then return end
+			local width = title.TextBounds and title.TextBounds.X or 0
+			icon.Position = UDim2.new(0.5, -(width / 2) - 22, 0.5, -7)
+		end
+
+		function comp:Paint(palette)
+			if self.Style == "primary" then
+				surface.BackgroundColor3 = palette.Accent
+				surface.BackgroundTransparency = U.Alpha(palette, self.Disabled and 0.6 or 0)
+				surfaceStroke.Color = palette.AccentGlow
+				surfaceStroke.Transparency = 0.35
+				title.TextColor3 = Color3.new(1, 1, 1)
+				if desc then desc.TextColor3 = Color3.new(0.86, 0.84, 1) end
+			else
+				surface.BackgroundColor3 = palette.Card
+				surface.BackgroundTransparency = U.Alpha(palette, self.Disabled and 0.5 or 0)
+				surfaceStroke.Color = self.Hovered and palette.AccentSoft or palette.Border
+				surfaceStroke.Transparency = self.Disabled and 0.7 or 0.1
+				title.TextColor3 = self.Disabled and palette.Muted or palette.Text
+				if desc then desc.TextColor3 = palette.Muted end
+			end
+		end
+
+		function comp:OnClick()
+			if self.Disabled or self.Enabled == false or self.Destroyed then return end
+			if type(self.Callback) == "function" then
+				U.SafeCall("Button(" .. tostring(self.Name) .. ")", self.Callback)
+			end
+		end
+
+		function comp:Click()
+			self:OnClick()
+		end
+
+		function comp:SetText(text)
+			title.Text = tostring(text or "")
+			placeIcon()
+		end
+
+		function comp:SetDisabled(value)
+			self.Disabled = value == true
+			self.Enabled = not self.Disabled
+			surface.Active = not self.Disabled
+			self:Paint(Env.Theme:Get())
+		end
+
+		-- mesma API dos outros componentes
+		function comp:SetEnabled(value)
+			self:SetDisabled(value == false)
+			return self.Enabled
+		end
+
+		function comp:SetVisible(value)
+			if self.Destroyed then return end
+			self.Visible = value ~= false
+			if row then row.Visible = self.Visible end
+		end
+
+		function comp:Destroy()
+			if self.Destroyed then return end
+			self.Destroyed = true
+			section:_unregister(self)
+			self.Maid:Clean()
+			if row then row:Destroy() end
+			row = nil
+			self.Row = nil
+		end
+
+		comp.Maid:Add(surface.MouseEnter:Connect(function()
+			comp.Hovered = true
+			comp:Paint(Env.Theme:Get())
+			U.Tween(surface, 0.12, {BackgroundTransparency = U.Alpha(Env.Theme:Get(), comp.Disabled and 0.5 or 0)})
+		end))
+		comp.Maid:Add(surface.MouseLeave:Connect(function()
+			comp.Hovered = false
+			comp:Paint(Env.Theme:Get())
+		end))
+		surface.MouseButton1Click:Connect(function() comp:OnClick() end)
+		comp.Maid:Add(surface.MouseButton1Click)
+
+		Support.BindTheme(comp, function(palette) comp:Paint(palette) end)
+		placeIcon()
+		if config.Enabled == false then comp:SetDisabled(true) end
+		section:_register(comp)
+		return comp
+	end
+
+	return Button
+end
+
+-- ── módulo: Toggle (src/Components/Toggle.lua) ───────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- TOGGLE
+--   Section:CreateToggle({Name, Description, Default, Callback})
+--   :SetValue(v, silent) · :GetValue() · :Toggle() · :Destroy()
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Toggle"] = function(Env)
+	local U = Env.Util
+	local Support = Env.Components.Support
+
+	local Toggle = {}
+	Toggle.__index = Toggle
+	Toggle.__typename = "Toggle"
+
+	function Toggle.new(section, config)
+		config = config or {}
+		local hasDesc = type(config.Description) == "string" and config.Description ~= ""
+		local comp = setmetatable(Support.MakeComponent({
+			kind = "Toggle",
+			name = config.Name or "Toggle",
+			description = config.Description,
+			row = nil,
+		}), Toggle)
+
+		comp.Callback = config.Callback
+		comp.Value = config.Default == true
+
+		local row = Support.Row(section.Content, hasDesc and 54 or 44)
+		comp.Row = row
+
+		local title, desc, paintText = Support.Title(row, config.Name or "Toggle", config.Description, 62, hasDesc and 7 or 12)
+
+		local track = U.New("TextButton", {
+			Size = UDim2.fromOffset(40, 22),
+			Position = UDim2.new(1, -12, 0.5, 0),
+			AnchorPoint = Vector2.new(1, 0.5),
+			BackgroundColor3 = Env.Theme:Get().Off or Color3.fromRGB(35, 40, 61),
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Text = "",
+			Parent = row,
+		})
+		U.Corner(track, 11)
+		comp.Track = track
+		comp:AddDim(track)
+
+		local knob = U.New("Frame", {
+			Size = UDim2.fromOffset(16, 16),
+			Position = UDim2.fromOffset(comp.Value and 21 or 3, 3),
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderSizePixel = 0,
+			Parent = track,
+		})
+		U.Corner(knob, 8)
+		comp.Knob = knob
+
+		local function position(silent)
+			local target = comp.Value and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3)
+			if silent then
+				knob.Position = target
+			else
+				U.Tween(knob, 0.14, {Position = target})
+			end
+		end
+
+		function comp:Paint(palette)
+			paintText(palette)
+			track.BackgroundColor3 = comp.Value and palette.Accent or (palette.Off or palette.CardHover)
+			track.BackgroundTransparency = U.Alpha(palette, 0)
+			knob.BackgroundColor3 = Color3.new(1, 1, 1)
+		end
+
+		function comp:SetValue(value, silent)
+			value = value == true
+			local changed = value ~= self.Value
+			self.Value = value
+			position(silent)
+			self:Paint(Env.Theme:Get())
+			if changed and not silent and type(self.Callback) == "function" then
+				U.SafeCall("Toggle(" .. tostring(self.Name) .. ")", self.Callback, value)
+			end
+			return value
+		end
+
+		function comp:GetValue()
+			return self.Value
+		end
+
+		function comp:Toggle(silent)
+			return self:SetValue(not self.Value, silent)
+		end
+
+		function comp:SetVisible(value)
+			if self.Destroyed then return end
+			self.Visible = value ~= false
+			if row then row.Visible = self.Visible end
+		end
+
+		function comp:Destroy()
+			if self.Destroyed then return end
+			self.Destroyed = true
+			section:_unregister(self)
+			self.Maid:Clean()
+			if row then row:Destroy() end
+			row = nil
+			self.Row = nil
+		end
+
+		local connection = track.MouseButton1Click:Connect(function()
+			if not comp.Enabled or comp.Destroyed then return end
+			comp:Toggle(false)
+		end)
+		comp.Maid:Add(connection)
+
+		Support.BindTheme(comp, function(palette) comp:Paint(palette) end)
+		position(true)
+		section:_register(comp)
+		if config.Enabled == false then comp:SetEnabled(false) end
+		return comp
+	end
+
+	return Toggle
+end
+
+-- ── módulo: Slider (src/Components/Slider.lua) ───────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- SLIDER
+--   Section:CreateSlider({Name, Min, Max, Default, Step, Suffix,
+--                         Format, Callback, OnChange})
+--   :SetValue(v, silent) · :GetValue() · :Destroy()
+-- Arrasta com mouse e com dedo; segura o valor dentro de Min/Max.
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Slider"] = function(Env)
+	local U = Env.Util
+	local Support = Env.Components.Support
+
+	local Slider = {}
+	Slider.__index = Slider
+	Slider.__typename = "Slider"
+
+	function Slider.new(section, config)
+		config = config or {}
+		local minimum = tonumber(config.Min) or 0
+		local maximum = tonumber(config.Max) or 100
+		if maximum <= minimum then maximum = minimum + 1 end
+		local step = tonumber(config.Step) or 0
+
+		local comp = setmetatable(Support.MakeComponent({
+			kind = "Slider",
+			name = config.Name or "Slider",
+			description = config.Description,
+			row = nil,
+		}), Slider)
+
+		comp.Min = minimum
+		comp.Max = maximum
+		comp.Step = step
+		comp.Callback = config.Callback
+		comp.OnChange = config.OnChange
+		comp.Format = config.Format
+		comp.Suffix = config.Suffix or ""
+
+		local start = tonumber(config.Default) or minimum
+		comp.Value = U.Clamp(start, minimum, maximum)
+		if step > 0 then comp.Value = U.Clamp(U.Round(comp.Value, step), minimum, maximum) end
+
+		local row = Support.Row(section.Content, 58, {Hover = false})
+		comp.Row = row
+
+		local title = U.Label(row, comp.Name, {
+			Font = Enum.Font.GothamMedium, Size = 12, Color = Env.Theme:Get().Text,
+		})
+		title.Size = UDim2.new(1, -90, 0, 16)
+		title.Position = UDim2.fromOffset(10, 10)
+
+		local valueLabel = U.Label(row, "", {
+			Font = Enum.Font.GothamBold, Size = 11, Color = Env.Theme:Get().AccentGlow,
+			Align = Enum.TextXAlignment.Right,
+		})
+		valueLabel.Size = UDim2.new(0, 80, 0, 16)
+		valueLabel.Position = UDim2.new(1, -90, 0, 10)
+
+		local track = U.New("Frame", {
+			Size = UDim2.new(1, -20, 0, 5),
+			Position = UDim2.fromOffset(10, 40),
+			BackgroundColor3 = Env.Theme:Get().Off,
+			BorderSizePixel = 0,
+			Parent = row,
+		})
+		U.Corner(track, 3)
+		comp.Track = track
+
+		local fill = U.New("Frame", {
+			Size = UDim2.new(0, 0, 1, 0),
+			BackgroundColor3 = Env.Theme:Get().Accent,
+			BorderSizePixel = 0,
+			Parent = track,
+		})
+		U.Corner(fill, 3)
+		comp.Fill = fill
+
+		local knob = U.New("Frame", {
+			Size = UDim2.fromOffset(12, 12),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0, 0, 0.5, 0),
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderSizePixel = 0,
+			Parent = track,
+		})
+		U.Corner(knob, 6)
+		local knobStroke = U.Stroke(knob, Env.Theme:Get().Accent, 1.5, 0)
+		comp.Knob = knob
+		comp:AddDim(track)
+		comp:AddDim(fill)
+		comp:AddDim(knob)
+		comp:AddDim(valueLabel)
+
+		local hit = U.New("TextButton", {
+			Size = UDim2.new(1, -14, 0, 24),
+			Position = UDim2.fromOffset(7, 30),
+			BackgroundTransparency = 1,
+			Text = "",
+			Parent = row,
+		})
+		comp.Hit = hit
+
+		local function ratio()
+			return (comp.Value - minimum) / (maximum - minimum)
+		end
+
+		local function valueText()
+			if type(comp.Format) == "function" then
+				local ok, text = pcall(comp.Format, comp.Value)
+				if ok and text ~= nil then return tostring(text) end
+			end
+			return U.FormatNumber(comp.Value, step > 0 and (step < 1 and 2 or 0) or (comp.Max - comp.Min <= 10 and 1 or 0)) .. comp.Suffix
+		end
+
+		local function paint()
+			local r = ratio()
+			fill.Size = UDim2.new(r, 0, 1, 0)
+			knob.Position = UDim2.new(r, 0, 0.5, 0)
+			valueLabel.Text = valueText()
+		end
+
+		function comp:Paint(palette)
+			title.TextColor3 = palette.Text
+			valueLabel.TextColor3 = palette.AccentGlow
+			track.BackgroundColor3 = palette.Off
+			track.BackgroundTransparency = U.Alpha(palette, 0)
+			fill.BackgroundColor3 = palette.Accent
+			knob.BackgroundColor3 = Color3.new(1, 1, 1)
+			knobStroke.Color = palette.Accent
+		end
+
+		local function commit(value, silent)
+			value = U.Clamp(tonumber(value) or comp.Value, minimum, maximum)
+			if step > 0 then value = U.Clamp(U.Round(value, step), minimum, maximum) end
+			local changed = value ~= comp.Value
+			comp.Value = value
+			paint()
+			if silent then return end
+			if type(comp.OnChange) == "function" then
+				U.SafeCall("Slider.OnChange(" .. tostring(comp.Name) .. ")", comp.OnChange, value)
+			end
+			if changed and type(comp.Callback) == "function" then
+				U.SafeCall("Slider(" .. tostring(comp.Name) .. ")", comp.Callback, value)
+			end
+		end
+
+		function comp:SetValue(value, silent)
+			commit(value, silent)
+			return self.Value
+		end
+
+		function comp:GetValue()
+			return self.Value
+		end
+
+		function comp:SetVisible(value)
+			if self.Destroyed then return end
+			self.Visible = value ~= false
+			if row then row.Visible = self.Visible end
+		end
+
+		function comp:Destroy()
+			if self.Destroyed then return end
+			self.Destroyed = true
+			section:_unregister(self)
+			self.Maid:Clean()
+			if row then row:Destroy() end
+			row = nil
+			self.Row = nil
+		end
+
+		local dragging = false
+		local function applyFromX(absoluteX)
+			local left = track.AbsolutePosition.X
+			local width = math.max(track.AbsoluteSize.X, 1)
+			commit(minimum + (maximum - minimum) * U.Clamp((absoluteX - left) / width, 0, 1), false)
+		end
+
+		comp.Maid:Add(hit.InputBegan:Connect(function(input)
+			if not comp.Enabled or comp.Destroyed then return end
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				applyFromX(input.Position.X)
+			end
+		end))
+
+		if U.UserInput then
+			comp.Maid:Add(U.UserInput.InputChanged:Connect(function(input)
+				if not dragging then return end
+				if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+					applyFromX(input.Position.X)
+				end
+			end))
+			comp.Maid:Add(U.UserInput.InputEnded:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+					dragging = false
+				end
+			end))
+		end
+
+		Support.BindTheme(comp, function(palette) comp:Paint(palette) end)
+		paint()
+		section:_register(comp)
+		if config.Enabled == false then comp:SetEnabled(false) end
+		return comp
+	end
+
+	return Slider
+end
+
+-- ── módulo: Dropdown (src/Components/Dropdown.lua) ───────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- DROPDOWN
+--   Section:CreateDropdown({Name, Options, Default, Multi, MaxHeight,
+--                           Callback})
+--   :SetValue(v, silent) · :GetValue() · :SetOptions(list)
+--   :Open() · :Close() · :Destroy()
+--
+-- Multi = true recebe/produz uma tabela ({["A"] = true}). A lista é aberta
+-- num popup preso à janela (não é cortada pelo ScrollingFrame da aba) e
+-- fecha ao clicar fora.
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Dropdown"] = function(Env)
+	local U = Env.Util
+	local Support = Env.Components.Support
+
+	local Dropdown = {}
+	Dropdown.__index = Dropdown
+	Dropdown.__typename = "Dropdown"
+
+	function Dropdown.new(section, config)
+		config = config or {}
+		local comp = setmetatable(Support.MakeComponent({
+			kind = "Dropdown",
+			name = config.Name or "Dropdown",
+			description = config.Description,
+			row = nil,
+		}), Dropdown)
+
+		comp.Callback = config.Callback
+		comp.Multi = config.Multi == true
+		comp.MaxHeight = tonumber(config.MaxHeight) or 190
+		comp.Options = {}
+		comp.Popup = nil
+		comp.IsOpen = false
+
+		for _, option in ipairs(config.Options or {}) do
+			table.insert(comp.Options, tostring(option))
+		end
+		comp.Value = comp.Multi and {} or (comp.Options[1] or "")
+		-- aplica o Default antes de existir UI (o método nasce mais abaixo)
+		if comp.Multi then
+			if type(config.Default) == "table" then
+				for _, option in ipairs(comp.Options) do
+					if config.Default[option] then comp.Value[option] = true end
+				end
+			end
+		elseif type(config.Default) == "string" then
+			comp.Value = config.Default
+		end
+
+		local row = Support.Row(section.Content, 58, {Hover = false})
+		comp.Row = row
+
+		local title = U.Label(row, comp.Name, {
+			Font = Enum.Font.GothamMedium, Size = 11, Color = Env.Theme:Get().Dim,
+		})
+		title.Size = UDim2.new(1, -20, 0, 14)
+		title.Position = UDim2.fromOffset(10, 7)
+
+		local box = U.New("TextButton", {
+			Size = UDim2.new(1, -20, 0, 28),
+			Position = UDim2.fromOffset(10, 24),
+			BackgroundColor3 = Env.Theme:Get().CardHover,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Text = "",
+			Parent = row,
+		})
+		U.Corner(box, 6)
+		local boxStroke = U.Stroke(box, Env.Theme:Get().Border, 1, 0.15)
+		comp.Box = box
+		comp:AddDim(box)
+
+		local valueLabel = U.Label(box, "", {
+			Font = Enum.Font.Gotham, Size = 10, Color = Env.Theme:Get().Text,
+		})
+		valueLabel.Size = UDim2.new(1, -34, 1, 0)
+		valueLabel.Position = UDim2.fromOffset(8, 0)
+		comp.ValueLabel = valueLabel
+
+		local chevron = Env.Icons("chevron", Env.Theme:Get().Muted, 10)
+		chevron.Position = UDim2.new(1, -20, 0.5, -5)
+		chevron.Parent = box
+		comp.ChevronHolder = chevron
+
+		local function display()
+			if comp.Multi then
+				local picked = {}
+				for _, option in ipairs(comp.Options) do
+					if comp.Value[option] then table.insert(picked, option) end
+				end
+				if #picked == 0 then
+					valueLabel.Text = "Nenhum selecionado"
+				elseif #picked <= 2 then
+					valueLabel.Text = table.concat(picked, ", ")
+				else
+					valueLabel.Text = tostring(#picked) .. " selecionados"
+				end
+			else
+				valueLabel.Text = tostring(comp.Value or "")
+			end
+		end
+
+		function comp:Paint(palette)
+			title.TextColor3 = palette.Dim
+			box.BackgroundColor3 = palette.CardHover
+			box.BackgroundTransparency = U.Alpha(palette, 0)
+			boxStroke.Color = self.IsOpen and palette.Accent or palette.Border
+			valueLabel.TextColor3 = palette.Text
+			if self.Popup then self:_PaintPopup(palette) end
+		end
+
+		-- ── popup ──────────────────────────────────────────────────────
+		function comp:_ClosePopup()
+			if self.Popup then
+				self.Popup.Backdrop:Destroy()
+				self.Popup.Frame:Destroy()
+				self.Popup = nil
+			end
+			self.IsOpen = false
+			self:Paint(Env.Theme:Get())
+		end
+
+		function comp:Close()
+			self:_ClosePopup()
+		end
+
+		function comp:_OptionClick(option)
+			if self.Multi then
+				self.Value[option] = not self.Value[option] or nil
+				display()
+				if type(self.Callback) == "function" then
+					local copy = {}
+					for key, value in pairs(self.Value) do copy[key] = value end
+					U.SafeCall("Dropdown(" .. tostring(self.Name) .. ")", self.Callback, copy)
+				end
+				if self.Popup then self:_BuildOptions() end
+			else
+				self.Value = option
+				display()
+				self:_ClosePopup()
+				if type(self.Callback) == "function" then
+					U.SafeCall("Dropdown(" .. tostring(self.Name) .. ")", self.Callback, option)
+				end
+			end
+		end
+
+		function comp:_PaintPopup(palette)
+			local popup = self.Popup
+			if not popup then return end
+			popup.Frame.BackgroundColor3 = palette.Panel
+			popup.Frame.BackgroundTransparency = U.Alpha(palette, 0)
+			popup.Stroke.Color = palette.Border
+			for _, button in ipairs(popup.Buttons) do
+				local selected = self.Multi and self.Value[button.Option] or (self.Value == button.Option)
+				button.Frame.BackgroundColor3 = selected and palette.AccentSoft or palette.Card
+				button.Frame.BackgroundTransparency = U.Alpha(palette, selected and 0.35 or 0.55)
+				button.Label.TextColor3 = selected and palette.Text or palette.Dim
+			end
+		end
+
+		function comp:_BuildOptions()
+			if not self.Popup then return end
+			local popup = self.Popup
+			for _, button in ipairs(popup.Buttons) do
+				button.Frame:Destroy()
+			end
+			popup.Buttons = {}
+
+			if #self.Options == 0 then
+				local empty = U.Label(popup.Content, "Sem opções", {
+					Font = Enum.Font.Gotham, Size = 10, Color = Env.Theme:Get().Muted,
+				})
+				empty.Size = UDim2.new(1, -16, 0, 26)
+				empty.Position = UDim2.fromOffset(8, 2)
+				popup.Buttons = {}
+				popup.Empty = empty
+				return
+			end
+
+			local height = math.min(#self.Options * 28 + 8, self.MaxHeight)
+			popup.Frame.Size = UDim2.fromOffset(popup.Width, height)
+			popup.Content.Size = UDim2.new(1, -4, 1, 0)
+			popup.Content.CanvasSize = UDim2.new(0, 0, 0, #self.Options * 28 + 8)
+
+			for index, option in ipairs(self.Options) do
+				local item = U.New("TextButton", {
+					Size = UDim2.new(1, -10, 0, 26),
+					Position = UDim2.fromOffset(5, 4 + (index - 1) * 28),
+					BackgroundColor3 = Env.Theme:Get().Card,
+					BackgroundTransparency = 0.55,
+					BorderSizePixel = 0,
+					AutoButtonColor = false,
+					Text = "",
+					LayoutOrder = index,
+					Parent = popup.Content,
+				})
+				U.Corner(item, 5)
+				local label = U.Label(item, option, {
+					Font = Enum.Font.Gotham, Size = 10, Color = Env.Theme:Get().Dim,
+				})
+				label.Size = UDim2.new(1, -12, 1, 0)
+				label.Position = UDim2.fromOffset(6, 0)
+				item.MouseEnter:Connect(function()
+					U.Tween(item, 0.1, {BackgroundTransparency = 0.3})
+				end)
+				item.MouseLeave:Connect(function()
+					if not (self.Multi and self.Value[option]) and self.Value ~= option then
+						U.Tween(item, 0.1, {BackgroundTransparency = 0.55})
+					end
+				end)
+				item.MouseButton1Click:Connect(function() self:_OptionClick(option) end)
+				table.insert(popup.Buttons, {Frame = item, Label = label, Option = option})
+			end
+			self:_PaintPopup(Env.Theme:Get())
+		end
+
+		function comp:Open()
+			if self.IsOpen or not self.Enabled or self.Destroyed then return end
+			local overlay = self.Section.Window and self.Section.Window.Overlay
+			if not overlay then return end
+
+			self.IsOpen = true
+
+			local backdrop = U.New("TextButton", {
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				Text = "",
+				AutoButtonColor = false,
+				ZIndex = 600,
+				Parent = overlay,
+			})
+			backdrop.MouseButton1Click:Connect(function() self:_ClosePopup() end)
+
+			local win = self.Section.Window
+			local scaleValue = win:GetScale()
+			local space = win:ToOverlaySpace(box.AbsolutePosition)
+			local boxWidth = box.AbsoluteSize.X / scaleValue
+			local boxHeight = box.AbsoluteSize.Y / scaleValue
+			local overlayHeight = win:OverlayHeight()
+
+			local width = math.max(160, boxWidth)
+			local rows = math.max(1, #self.Options)
+			local desired = math.min(rows * 28 + 8, self.MaxHeight)
+			local belowY = space.Y + boxHeight + 4
+			local aboveY = space.Y - desired - 4
+			local y = belowY
+			if belowY + desired > overlayHeight - 8 and aboveY > 8 then
+				y = aboveY
+			end
+
+			local frame = U.New("Frame", {
+				Size = UDim2.fromOffset(width, desired),
+				Position = UDim2.fromOffset(space.X, y),
+				BackgroundColor3 = Env.Theme:Get().Panel,
+				BorderSizePixel = 0,
+				ClipsDescendants = true,
+				ZIndex = 601,
+				Parent = overlay,
+			})
+			U.Corner(frame, 8)
+
+			local stroke = U.Stroke(frame, Env.Theme:Get().Border, 1, 0)
+
+			local content = U.New("ScrollingFrame", {
+				Size = UDim2.new(1, -4, 1, 0),
+				Position = UDim2.fromOffset(2, 0),
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				CanvasSize = UDim2.new(0, 0, 0, rows * 28 + 8),
+				ScrollBarThickness = 3,
+				ScrollBarImageColor3 = Env.Theme:Get().AccentSoft,
+				ScrollingDirection = Enum.ScrollingDirection.Y,
+				ZIndex = 602,
+				Parent = frame,
+			})
+
+			self.Popup = {
+				Backdrop = backdrop,
+				Frame = frame,
+				Stroke = stroke,
+				Content = content,
+				Buttons = {},
+				Width = width,
+			}
+
+			local ok, err = pcall(function() self:_BuildOptions() end)
+			if not ok then
+				warn("[Expander] dropdown: " .. tostring(err))
+				self:_ClosePopup()
+				return
+			end
+
+			frame.Size = UDim2.fromOffset(width, 0)
+			U.Tween(frame, 0.14, {Size = UDim2.fromOffset(width, desired)})
+			self:Paint(Env.Theme:Get())
+		end
+
+		function comp:ToggleMenu()
+			if not self.Enabled or self.Destroyed then return end
+			if self.IsOpen then self:_ClosePopup() else self:Open() end
+		end
+
+		-- desativar fecha o menu aberto e bloqueia cliques
+		function comp:ApplyEnabled(value)
+			if not value and self.IsOpen then self:_ClosePopup() end
+		end
+
+		-- ── valores ────────────────────────────────────────────────────
+		function comp:_ApplyDefault(value)
+			if comp.Multi then
+				comp.Value = {}
+				if type(value) == "table" then
+					for _, option in ipairs(comp.Options) do
+						if value[option] then comp.Value[option] = true end
+					end
+				end
+			else
+				if type(value) == "string" then
+					comp.Value = value
+				else
+					comp.Value = comp.Options[1] or ""
+				end
+			end
+		end
+
+		local function sameSet(a, b)
+			for key in pairs(a or {}) do if not (b or {})[key] then return false end end
+			for key in pairs(b or {}) do if not (a or {})[key] then return false end end
+			return true
+		end
+
+		function comp:SetValue(value, silent)
+			if self.Multi then
+				local nextValue = {}
+				if type(value) == "table" then
+					for _, option in ipairs(self.Options) do
+						if value[option] then nextValue[option] = true end
+					end
+				end
+				local changed = not sameSet(self.Value, nextValue)
+				self.Value = nextValue
+				display()
+				if changed and not silent and type(self.Callback) == "function" then
+					U.SafeCall("Dropdown(" .. tostring(self.Name) .. ")", self.Callback, nextValue)
+				end
+				return nextValue
+			end
+
+			local candidate = value ~= nil and tostring(value) or ""
+			local exists = false
+			for _, option in ipairs(self.Options) do
+				if option == candidate then exists = true break end
+			end
+			if not exists then
+				-- opção que não existe (ou removida em runtime): não inventa estado
+				if candidate ~= "" then
+					warn("[Expander] Dropdown(" .. tostring(self.Name) .. "): opção inexistente '" .. candidate .. "'")
+				end
+				candidate = self.Options[1] or ""
+				if self.Value == candidate or (self.Value == nil and candidate == "") then
+					display()
+					return self.Value
+				end
+			end
+
+			local changed = self.Value ~= candidate
+			self.Value = candidate
+			display()
+			if changed and not silent and type(self.Callback) == "function" then
+				U.SafeCall("Dropdown(" .. tostring(self.Name) .. ")", self.Callback, self.Value)
+			end
+			return self.Value
+		end
+
+		function comp:GetValue()
+			return self.Value
+		end
+
+		function comp:SetOptions(options, keepValue)
+			local list = {}
+			for _, option in ipairs(options or {}) do table.insert(list, tostring(option)) end
+			self.Options = list
+
+			if self.Multi then
+				local filtered = {}
+				for option in pairs(self.Value) do
+					local stillThere = false
+					for _, candidate in ipairs(list) do
+						if candidate == option then stillThere = true break end
+					end
+					if stillThere then filtered[option] = true end
+				end
+				self.Value = filtered
+			else
+				local found = false
+				for _, candidate in ipairs(list) do
+					if candidate == self.Value then found = true break end
+				end
+				if not found then self.Value = list[1] or "" end
+			end
+			display()
+			if self.IsOpen then self:_BuildOptions() end
+		end
+
+		function comp:GetOptions()
+			local copy = {}
+			for index, option in ipairs(self.Options) do copy[index] = option end
+			return copy
+		end
+
+		function comp:SetVisible(value)
+			if self.Destroyed then return end
+			self.Visible = value ~= false
+			if row then row.Visible = self.Visible end
+			if not self.Visible then self:_ClosePopup() end
+		end
+
+		function comp:Destroy()
+			if self.Destroyed then return end
+			self.Destroyed = true
+			self:_ClosePopup()
+			section:_unregister(self)
+			self.Maid:Clean()
+			if row then row:Destroy() end
+			row = nil
+			self.Row = nil
+		end
+
+		comp.Maid:Add(box.MouseButton1Click:Connect(function() comp:ToggleMenu() end))
+
+		Support.BindTheme(comp, function(palette) comp:Paint(palette) end)
+		if config.Enabled == false then comp:SetEnabled(false) end
+		display()
+		section:_register(comp)
+		return comp
+	end
+
+	return Dropdown
+end
+
+-- ── módulo: Input (src/Components/Input.lua) ─────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- INPUT — campo de texto
+--   Section:CreateInput({Name, Placeholder, Default, Callback, Validate})
+--   :SetValue(text) · :GetValue() · :Destroy()
+-- Callback roda ao apertar Enter ou ao sair do campo; Validate devolve
+-- (true) para aceitar ou (false, "motivo") para recusar.
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Input"] = function(Env)
+	local U = Env.Util
+	local Support = Env.Components.Support
+
+	local Input = {}
+	Input.__index = Input
+	Input.__typename = "Input"
+
+	function Input.new(section, config)
+		config = config or {}
+		local comp = setmetatable(Support.MakeComponent({
+			kind = "Input",
+			name = config.Name or "Campo",
+			description = config.Description,
+			row = nil,
+		}), Input)
+		comp.Callback = config.Callback
+		comp.Validate = config.Validate
+
+		local row = Support.Row(section.Content, 58, {Hover = false})
+		comp.Row = row
+
+		local title = U.Label(row, comp.Name, {
+			Font = Enum.Font.GothamMedium, Size = 11, Color = Env.Theme:Get().Dim,
+		})
+		title.Size = UDim2.new(1, -20, 0, 14)
+		title.Position = UDim2.fromOffset(10, 7)
+
+		local box = U.New("Frame", {
+			Size = UDim2.new(1, -20, 0, 26),
+			Position = UDim2.fromOffset(10, 24),
+			BackgroundColor3 = Env.Theme:Get().CardHover,
+			BorderSizePixel = 0,
+			Parent = row,
+		})
+		U.Corner(box, 6)
+		local boxStroke = U.Stroke(box, Env.Theme:Get().Border, 1, 0.15)
+		comp.Box = box
+
+		local textBox = U.New("TextBox", {
+			Size = UDim2.new(1, -16, 1, 0),
+			Position = UDim2.fromOffset(8, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Font = Enum.Font.Gotham,
+			TextSize = 11,
+			TextColor3 = Env.Theme:Get().Text,
+			PlaceholderText = config.Placeholder or "digite...",
+			PlaceholderColor3 = Env.Theme:Get().Muted,
+			Text = tostring(config.Default or ""),
+			TextXAlignment = Enum.TextXAlignment.Left,
+			ClearTextOnFocus = false,
+			TextEditable = true,
+			Parent = box,
+		})
+		comp.TextBox = textBox
+		comp:AddDim(box)
+		comp:AddDim(textBox)
+		comp.Value = textBox.Text
+
+		local function commit()
+			local value = textBox.Text
+			if type(comp.Validate) == "function" then
+				local ok, accepted, reason = pcall(comp.Validate, value)
+				if ok and accepted == false then
+					textBox.Text = comp.Value
+					if U.OnError == nil then
+						warn("[Expander] entrada recusada: " .. tostring(reason or "valor inválido"))
+					end
+					return
+				end
+			end
+			comp.Value = value
+			if type(comp.Callback) == "function" then
+				U.SafeCall("Input(" .. tostring(comp.Name) .. ")", comp.Callback, value)
+			end
+		end
+
+		function comp:Paint(palette)
+			title.TextColor3 = palette.Dim
+			box.BackgroundColor3 = palette.CardHover
+			box.BackgroundTransparency = U.Alpha(palette, 0)
+			boxStroke.Color = self.Focused and palette.Accent or palette.Border
+			textBox.TextColor3 = palette.Text
+			textBox.PlaceholderColor3 = palette.Muted
+		end
+
+		function comp:ApplyEnabled(value)
+			if textBox then textBox.TextEditable = value end
+			if not value then
+				comp.Focused = false
+				if textBox then pcall(function() textBox:ReleaseFocus() end) end
+			end
+		end
+
+		function comp:SetValue(value, silent)
+			value = tostring(value or "")
+			self.Value = value
+			textBox.Text = value
+			if not silent and type(self.Callback) == "function" then
+				U.SafeCall("Input(" .. tostring(self.Name) .. ")", self.Callback, value)
+			end
+		end
+
+		function comp:GetValue()
+			return textBox.Text
+		end
+
+		function comp:SetVisible(value)
+			if self.Destroyed then return end
+			self.Visible = value ~= false
+			if row then row.Visible = self.Visible end
+		end
+
+		function comp:Destroy()
+			if self.Destroyed then return end
+			self.Destroyed = true
+			section:_unregister(self)
+			self.Maid:Clean()
+			if row then row:Destroy() end
+			row = nil
+			self.Row = nil
+		end
+
+		comp.Maid:Add(textBox.Focused:Connect(function()
+			if not comp.Enabled or comp.Destroyed then
+				pcall(function() textBox:ReleaseFocus() end)
+				return
+			end
+			comp.Focused = true
+			comp:Paint(Env.Theme:Get())
+			U.Tween(boxStroke, 0.12, {Transparency = 0})
+		end))
+		comp.Maid:Add(textBox.FocusLost:Connect(function(enterPressed)
+			comp.Focused = false
+			comp:Paint(Env.Theme:Get())
+			if enterPressed then commit() end
+		end))
+
+		Support.BindTheme(comp, function(palette) comp:Paint(palette) end)
+		section:_register(comp)
+		if config.Enabled == false then comp:SetEnabled(false) end
+		return comp
+	end
+
+	return Input
+end
+
+-- ── módulo: Label (src/Components/Label.lua) ─────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- LABEL — linha informativa de uma linha
+--   Section:CreateLabel({Text, Color})
+--   :SetText(text) · :Destroy()
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Label"] = function(Env)
+	local U = Env.Util
+	local Support = Env.Components.Support
+
+	local Label = {}
+	Label.__index = Label
+	Label.__typename = "Label"
+
+	function Label.new(section, config)
+		config = config or {}
+		local comp = setmetatable(Support.MakeComponent({
+			kind = "Label",
+			name = config.Name or config.Text or "Label",
+			row = nil,
+			enabled = config.Enabled ~= false,
+		}), Label)
+		local row = Support.Row(section.Content, 24, {Hover = false})
+		comp.Row = row
+
+		local text = U.Label(row, config.Text or "", {
+			Font = Enum.Font.GothamMedium,
+			Size = 11,
+			Color = Env.Theme:Get().Dim,
+		})
+		text.Size = UDim2.new(1, -12, 1, 0)
+		text.Position = UDim2.fromOffset(4, 0)
+		comp.Text = text
+
+		function comp:Paint(palette)
+			text.TextColor3 = config.Color or palette.Dim
+		end
+
+		function comp:SetText(value)
+			text.Text = tostring(value or "")
+			if not config.Name then self.Name = text.Text end
+		end
+
+		function comp:GetText()
+			return text.Text
+		end
+
+		function comp:SetVisible(value)
+			if self.Destroyed then return end
+			self.Visible = value ~= false
+			if row then row.Visible = self.Visible end
+		end
+
+		function comp:Destroy()
+			if self.Destroyed then return end
+			self.Destroyed = true
+			section:_unregister(self)
+			self.Maid:Clean()
+			if row then row:Destroy() end
+			row = nil
+			self.Row = nil
+		end
+
+		Support.BindTheme(comp, function(palette) comp:Paint(palette) end)
+		section:_register(comp)
+		return comp
+	end
+
+	return Label
+end
+
+-- ── módulo: Paragraph (src/Components/Paragraph.lua) ─────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- PARAGRAPH — bloco de texto com quebra automática e altura dinâmica
+--   Section:CreateParagraph({Text, Title})
+--   :SetText(text) · :Destroy()
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Paragraph"] = function(Env)
+	local U = Env.Util
+	local Support = Env.Components.Support
+
+	local Paragraph = {}
+	Paragraph.__index = Paragraph
+	Paragraph.__typename = "Paragraph"
+
+	function Paragraph.new(section, config)
+		config = config or {}
+		local comp = setmetatable(Support.MakeComponent({
+			kind = "Paragraph",
+			name = config.Title or "Parágrafo",
+			row = nil,
+			enabled = config.Enabled ~= false,
+		}), Paragraph)
+
+		local row = Support.Row(section.Content, 0, {Hover = false})
+		row.AutomaticSize = Enum.AutomaticSize.Y
+		row.Size = UDim2.new(1, 0, 0, 0)
+		row.ClipsDescendants = false
+		comp.Row = row
+
+		local holder = U.New("Frame", {
+			Size = UDim2.new(1, -8, 0, 0),
+			Position = UDim2.fromOffset(4, 4),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Parent = row,
+		})
+		U.List(holder, {Padding = 4})
+
+		if config.Title and config.Title ~= "" then
+			local title = U.Label(holder, config.Title, {
+				Font = Enum.Font.GothamBold,
+				Size = 11,
+				Color = Env.Theme:Get().Text,
+			})
+			title.Size = UDim2.new(1, 0, 0, 14)
+			comp.TitleLabel = title
+		end
+
+		local body = U.Label(holder, config.Text or "", {
+			Font = Enum.Font.Gotham,
+			Size = 10,
+			Color = Env.Theme:Get().Dim,
+			Wrap = true,
+			Truncate = Enum.TextTruncate.None,
+		})
+		body.Size = UDim2.new(1, 0, 0, 0)
+		body.AutomaticSize = Enum.AutomaticSize.Y
+		comp.Text = body
+
+		function comp:Paint(palette)
+			body.TextColor3 = palette.Dim
+			if comp.TitleLabel then comp.TitleLabel.TextColor3 = palette.Text end
+		end
+
+		function comp:SetText(value)
+			body.Text = tostring(value or "")
+		end
+
+		function comp:GetText()
+			return body.Text
+		end
+
+		function comp:SetVisible(value)
+			if self.Destroyed then return end
+			self.Visible = value ~= false
+			if row then row.Visible = self.Visible end
+		end
+
+		function comp:Destroy()
+			if self.Destroyed then return end
+			self.Destroyed = true
+			section:_unregister(self)
+			self.Maid:Clean()
+			if row then row:Destroy() end
+			row = nil
+			self.Row = nil
+		end
+
+		Support.BindTheme(comp, function(palette) comp:Paint(palette) end)
+		section:_register(comp)
+		return comp
+	end
+
+	return Paragraph
+end
+
+-- ── módulo: Keybind (src/Components/Keybind.lua) ─────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- KEYBIND
+--   Section:CreateKeybind({Name, Description, Default, Callback})
+--   :SetValue(keyCode) · :GetValue() · :SetEnabled(bool) · :Destroy()
+-- Clique no chip e pressione uma tecla (Esc cancela). O interruptor ao
+-- lado desativa só o atalho, sem perder a tecla escolhida.
+-- Nada aqui dispara teclas sozinho: só reage ao que o usuário aperta.
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Keybind"] = function(Env)
+	local U = Env.Util
+	local Support = Env.Components.Support
+
+	local Keybind = {}
+	Keybind.__index = Keybind
+	Keybind.__typename = "Keybind"
+
+	function Keybind.new(section, config)
+		config = config or {}
+		local comp = setmetatable(Support.MakeComponent({
+			kind = "Keybind",
+			name = config.Name or "Keybind",
+			description = config.Description,
+			row = nil,
+		}), Keybind)
+
+		comp.Callback = config.Callback
+		comp.Value = config.Default or nil
+		comp.Enabled = true
+		comp.Listening = false
+
+		local row = Support.Row(section.Content, 52)
+		comp.Row = row
+
+		local title, desc, paintText = Support.Title(row, comp.Name, config.Description, 132, config.Description and 7 or 12)
+
+		local chip = U.New("TextButton", {
+			Size = UDim2.fromOffset(64, 24),
+			Position = UDim2.new(1, -56, 0.5, 0),
+			AnchorPoint = Vector2.new(1, 0.5),
+			BackgroundColor3 = Env.Theme:Get().CardHover,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Text = "",
+			Parent = row,
+		})
+		U.Corner(chip, 6)
+		local chipStroke = U.Stroke(chip, Env.Theme:Get().Border, 1, 0.1)
+		local chipLabel = U.Label(chip, "—", {
+			Font = Enum.Font.GothamBold, Size = 10, Color = Env.Theme:Get().Text,
+			Align = Enum.TextXAlignment.Center,
+		})
+		chipLabel.Size = UDim2.fromScale(1, 1)
+
+		-- interruptor pequeno (liga/desliga o atalho)
+		local switch = U.New("TextButton", {
+			Size = UDim2.fromOffset(36, 20),
+			Position = UDim2.new(1, -12, 0.5, 0),
+			AnchorPoint = Vector2.new(1, 0.5),
+			BackgroundColor3 = Env.Theme:Get().Accent,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Text = "",
+			Parent = row,
+		})
+		U.Corner(switch, 10)
+		local knob = U.New("Frame", {
+			Size = UDim2.fromOffset(14, 14),
+			Position = UDim2.fromOffset(comp.Enabled and 19 or 3, 3),
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BorderSizePixel = 0,
+			Parent = switch,
+		})
+		U.Corner(knob, 7)
+
+		local function keyName()
+			if comp.Listening then return "..." end
+			if comp.Value then
+				return tostring(comp.Value.Name or comp.Value)
+			end
+			return "—"
+		end
+
+		local function paint()
+			chipLabel.Text = keyName()
+			chip.BackgroundColor3 = comp.Listening and Env.Theme:Get().AccentSoft or Env.Theme:Get().CardHover
+			switch.BackgroundColor3 = comp.Enabled and Env.Theme:Get().Accent or Env.Theme:Get().Off
+			knob.Position = UDim2.fromOffset(comp.Enabled and 19 or 3, 3)
+		end
+
+		function comp:Paint(palette)
+			paintText(palette)
+			chip.BackgroundColor3 = self.Listening and palette.AccentSoft or palette.CardHover
+			chip.BackgroundTransparency = U.Alpha(palette, 0)
+			chipStroke.Color = self.Listening and palette.Accent or palette.Border
+			chipLabel.TextColor3 = self.Listening and palette.AccentGlow or palette.Text
+			switch.BackgroundColor3 = self.Enabled and palette.Accent or palette.Off
+			knob.BackgroundColor3 = Color3.new(1, 1, 1)
+		end
+
+		function comp:SetValue(keyCode, silent)
+			if keyCode ~= nil then
+				local valid = type(keyCode) == "userdata"
+					or (type(keyCode) == "table" and type(keyCode.Name) == "string")
+				if not valid then
+					warn("[Expander] Keybind:SetValue espera um Enum.KeyCode (ou nil)")
+					return self:GetValue()
+				end
+			end
+			self.Value = keyCode
+			paint()
+			if not silent and type(self.Callback) == "function" then
+				U.SafeCall("Keybind(" .. tostring(self.Name) .. ").Bind", self.Callback, keyCode)
+			end
+			return keyCode
+		end
+
+		function comp:GetValue()
+			return self.Value
+		end
+
+		function comp:SetEnabled(value)
+			self.Enabled = value ~= false
+			paint()
+		end
+
+		function comp:IsEnabled()
+			return self.Enabled
+		end
+
+		function comp:SetVisible(value)
+			if self.Destroyed then return end
+			self.Visible = value ~= false
+			if row then row.Visible = self.Visible end
+		end
+
+		function comp:Destroy()
+			if self.Destroyed then return end
+			self.Destroyed = true
+			section:_unregister(self)
+			self.Maid:Clean()
+			if row then row:Destroy() end
+			row = nil
+			self.Row = nil
+		end
+
+		comp.Maid:Add(chip.MouseButton1Click:Connect(function()
+			comp.Listening = not comp.Listening
+			comp:Paint(Env.Theme:Get())
+		end))
+		comp.Maid:Add(switch.MouseButton1Click:Connect(function()
+			comp.Enabled = not comp.Enabled
+			comp:Paint(Env.Theme:Get())
+		end))
+
+		if U.UserInput then
+			comp.Maid:Add(U.UserInput.InputBegan:Connect(function(input)
+				if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+				if comp.Listening then
+					if input.KeyCode == Enum.KeyCode.Escape then
+						comp.Listening = false
+						comp:Paint(Env.Theme:Get())
+						return
+					end
+					comp.Listening = false
+					comp:SetValue(input.KeyCode)
+					comp:Paint(Env.Theme:Get())
+					return
+				end
+				if comp.Enabled and comp.Value and input.KeyCode == comp.Value then
+					if type(comp.Callback) == "function" then
+						U.SafeCall("Keybind(" .. tostring(comp.Name) .. ")", comp.Callback, comp.Value)
+					end
+				end
+			end))
+		else
+			chip.Active = false
+			chipLabel.Text = "sem teclado"
+		end
+
+		Support.BindTheme(comp, function(palette) comp:Paint(palette) end)
+		paint()
+		section:_register(comp)
+		return comp
+	end
+
+	return Keybind
+end
+
+-- ── módulo: ColorPicker (src/Components/ColorPicker.lua) ─────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- COLOR PICKER
+--   Section:CreateColorPicker({Name, Default = Color3, Callback})
+--   :SetValue(color) · :GetValue() · :Destroy()
+--
+-- Três trilhos (matiz, saturação, brilho) + prévia. Devolve sempre um
+-- Color3 novo. A conversão é feita aqui dentro (não depende de
+-- Color3.toHSV/fromHSV do Luau, então funciona também em 5.1).
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["ColorPicker"] = function(Env)
+	local U = Env.Util
+	local Support = Env.Components.Support
+
+	local ColorPicker = {}
+	ColorPicker.__index = ColorPicker
+	ColorPicker.__typename = "ColorPicker"
+
+	-- HSV (0..1) -> Color3
+	local function hsvToColor(h, s, v)
+		if s <= 0 then
+			return Color3.new(v, v, v)
+		end
+		h = (h % 1) * 6
+		local sector = math.floor(h)
+		local fraction = h - sector
+		local p = v * (1 - s)
+		local q = v * (1 - s * fraction)
+		local t = v * (1 - s * (1 - fraction))
+		if sector == 0 then return Color3.new(v, t, p) end
+		if sector == 1 then return Color3.new(q, v, p) end
+		if sector == 2 then return Color3.new(p, v, t) end
+		if sector == 3 then return Color3.new(p, q, v) end
+		if sector == 4 then return Color3.new(t, p, v) end
+		return Color3.new(v, p, q)
+	end
+
+	-- Color3 -> h, s, v
+	local function colorToHsv(color)
+		local r, g, b = color.R, color.G, color.B
+		local maximum = math.max(r, g, b)
+		local minimum = math.min(r, g, b)
+		local delta = maximum - minimum
+		local h = 0
+		if delta > 0 then
+			if maximum == r then
+				h = ((g - b) / delta) % 6
+			elseif maximum == g then
+				h = (b - r) / delta + 2
+			else
+				h = (r - g) / delta + 4
+			end
+			h = h / 6
+		end
+		local s = 0
+		if maximum > 0 then s = delta / maximum end
+		return h, s, maximum
+	end
+
+	function ColorPicker.new(section, config)
+		config = config or {}
+		local comp = setmetatable(Support.MakeComponent({
+			kind = "ColorPicker",
+			name = config.Name or "Cor",
+			row = nil,
+		}), ColorPicker)
+
+		comp.Callback = config.Callback
+		local default = config.Default or Color3.fromRGB(106, 61, 245)
+		comp.H, comp.S, comp.V = colorToHsv(default)
+
+		local row = Support.Row(section.Content, 120, {Hover = false})
+		comp.Row = row
+
+		local title = U.Label(row, comp.Name, {
+			Font = Enum.Font.GothamMedium, Size = 12, Color = Env.Theme:Get().Text,
+		})
+		title.Size = UDim2.new(1, -110, 0, 16)
+		title.Position = UDim2.fromOffset(10, 9)
+
+		local preview = U.New("Frame", {
+			Size = UDim2.fromOffset(18, 18),
+			Position = UDim2.new(1, -92, 0, 8),
+			BackgroundColor3 = default,
+			BorderSizePixel = 0,
+			Parent = row,
+		})
+		U.Corner(preview, 5)
+		U.Stroke(preview, Color3.new(1, 1, 1), 1, 0.7)
+		comp:AddDim(preview)
+
+		local hexLabel = U.Label(row, U.Hex(default), {
+			Font = Enum.Font.Code, Size = 10, Color = Env.Theme:Get().Dim,
+			Align = Enum.TextXAlignment.Right,
+		})
+		hexLabel.Size = UDim2.fromOffset(62, 18)
+		hexLabel.Position = UDim2.new(1, -70, 0, 8)
+
+		-- ── três trilhos ───────────────────────────────────────────────
+		local tracks = {}
+
+		local function buildTrack(labelText, index, y, getRatio, onDrag)
+			local label = U.Label(row, labelText, {
+				Font = Enum.Font.Gotham, Size = 9, Color = Env.Theme:Get().Muted,
+			})
+			label.Size = UDim2.fromOffset(14, 14)
+			label.Position = UDim2.fromOffset(10, y + 2)
+
+			local track = U.New("Frame", {
+				Size = UDim2.new(1, -44, 0, 5),
+				Position = UDim2.fromOffset(28, y + 6),
+				BackgroundColor3 = Env.Theme:Get().Off,
+				BorderSizePixel = 0,
+				Parent = row,
+			})
+			U.Corner(track, 3)
+
+			local fill = U.New("Frame", {
+				Size = UDim2.new(getRatio(), 0, 1, 0),
+				BackgroundColor3 = Env.Theme:Get().Accent,
+				BorderSizePixel = 0,
+				Parent = track,
+			})
+			U.Corner(fill, 3)
+
+			local knob = U.New("Frame", {
+				Size = UDim2.fromOffset(11, 11),
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.new(getRatio(), 0, 0.5, 0),
+				BackgroundColor3 = Color3.new(1, 1, 1),
+				BorderSizePixel = 0,
+				Parent = track,
+			})
+			U.Corner(knob, 6)
+
+			local hit = U.New("TextButton", {
+				Size = UDim2.new(1, -34, 0, 18),
+				Position = UDim2.fromOffset(23, y - 2),
+				BackgroundTransparency = 1,
+				Text = "",
+				Parent = row,
+			})
+
+			tracks[index] = {Track = track, Fill = fill, Knob = knob, GetRatio = getRatio}
+			comp:AddDim(track)
+			comp:AddDim(fill)
+			comp:AddDim(knob)
+
+			local dragging = false
+			local function apply(absoluteX)
+				local left = track.AbsolutePosition.X
+				local width = math.max(track.AbsoluteSize.X, 1)
+				onDrag(U.Clamp((absoluteX - left) / width, 0, 1))
+			end
+			comp.Maid:Add(hit.InputBegan:Connect(function(input)
+				if not comp.Enabled or comp.Destroyed then return end
+				if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+					dragging = true
+					apply(input.Position.X)
+				end
+			end))
+			if U.UserInput then
+				comp.Maid:Add(U.UserInput.InputChanged:Connect(function(input)
+					if not dragging then return end
+					if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+						apply(input.Position.X)
+					end
+				end))
+				comp.Maid:Add(U.UserInput.InputEnded:Connect(function(input)
+					if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+						dragging = false
+					end
+				end))
+			end
+			return track
+		end
+
+		local function currentColor()
+			return hsvToColor(comp.H, comp.S, comp.V)
+		end
+
+		local function refreshTracks()
+			local values = {comp.H, comp.S, comp.V}
+			for index, entry in ipairs(tracks) do
+				local ratio = U.Clamp(values[index], 0, 1)
+				entry.Fill.Size = UDim2.new(ratio, 0, 1, 0)
+				entry.Knob.Position = UDim2.new(ratio, 0, 0.5, 0)
+			end
+		end
+
+		local function refreshPreview()
+			local color = currentColor()
+			preview.BackgroundColor3 = color
+			hexLabel.Text = U.Hex(color)
+			return color
+		end
+
+		local function changed(silent)
+			refreshTracks()
+			local color = refreshPreview()
+			if not silent and type(comp.Callback) == "function" then
+				U.SafeCall("ColorPicker(" .. tostring(comp.Name) .. ")", comp.Callback, color)
+			end
+			return color
+		end
+
+		buildTrack("H", 1, 34, function() return comp.H end, function(ratio)
+			comp.H = ratio
+			changed(false)
+		end)
+		buildTrack("S", 2, 56, function() return comp.S end, function(ratio)
+			comp.S = ratio
+			changed(false)
+		end)
+		buildTrack("V", 3, 78, function() return comp.V end, function(ratio)
+			comp.V = ratio
+			changed(false)
+		end)
+
+		function comp:Paint(palette)
+			title.TextColor3 = palette.Text
+			hexLabel.TextColor3 = palette.Dim
+			for _, entry in ipairs(tracks) do
+				entry.Track.BackgroundColor3 = palette.Off
+				entry.Fill.BackgroundColor3 = palette.Accent
+				entry.Knob.BackgroundColor3 = Color3.new(1, 1, 1)
+			end
+		end
+
+		function comp:SetValue(color, silent)
+			if typeof and typeof(color) ~= "Color3" then
+				warn("[Expander] ColorPicker:SetValue espera um Color3")
+				return self:GetValue()
+			end
+			self.H, self.S, self.V = colorToHsv(color)
+			return changed(silent)
+		end
+
+		function comp:GetValue()
+			return currentColor()
+		end
+
+		function comp:SetVisible(value)
+			if self.Destroyed then return end
+			self.Visible = value ~= false
+			if row then row.Visible = self.Visible end
+		end
+
+		function comp:Destroy()
+			if self.Destroyed then return end
+			self.Destroyed = true
+			section:_unregister(self)
+			self.Maid:Clean()
+			if row then row:Destroy() end
+			row = nil
+			self.Row = nil
+		end
+
+		Support.BindTheme(comp, function(palette) comp:Paint(palette) end)
+		refreshTracks()
+		refreshPreview()
+		section:_register(comp)
+		if config.Enabled == false then comp:SetEnabled(false) end
+		return comp
+	end
+
+	return ColorPicker
+end
+
+-- ── módulo: Divider (src/Components/Divider.lua) ─────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- DIVIDER — separador visual
+--   Section:CreateDivider()
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Divider"] = function(Env)
+	local U = Env.Util
+	local Support = Env.Components.Support
+
+	local Divider = {}
+	Divider.__index = Divider
+	Divider.__typename = "Divider"
+
+	function Divider.new(section, config)
+		config = config or {}
+		local comp = setmetatable(Support.MakeComponent({
+			kind = "Divider",
+			name = "Separador",
+			row = nil,
+			enabled = config.Enabled ~= false,
+		}), Divider)
+		local row = Support.Row(section.Content, 10, {Hover = false})
+		row.BackgroundTransparency = 1
+		comp.Row = row
+
+		local line = U.New("Frame", {
+			Size = UDim2.new(1, -8, 0, 1),
+			Position = UDim2.new(0, 4, 0.5, 0),
+			AnchorPoint = Vector2.new(0, 0.5),
+			BackgroundColor3 = Env.Theme:Get().Border,
+			BackgroundTransparency = 0.2,
+			BorderSizePixel = 0,
+			Parent = row,
+		})
+		comp.Line = line
+
+		function comp:Paint(palette)
+			line.BackgroundColor3 = palette.Border
+		end
+
+		function comp:SetVisible(value)
+			if self.Destroyed then return end
+			self.Visible = value ~= false
+			if row then row.Visible = self.Visible end
+		end
+
+		function comp:Destroy()
+			if self.Destroyed then return end
+			self.Destroyed = true
+			section:_unregister(self)
+			self.Maid:Clean()
+			if row then row:Destroy() end
+			row = nil
+			self.Row = nil
+		end
+
+		Support.BindTheme(comp, function(palette) comp:Paint(palette) end)
+		section:_register(comp)
+		return comp
+	end
+
+	return Divider
+end
+
+-- ── módulo: Section (src/Section.lua) ────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- SECTION — cartão com título e pilha automática de componentes
+--
+--   local sec = Tab:CreateSection({Name = "Combate", Description = "..."})
+--   sec:CreateToggle({...})            -- todos os Create* disponíveis
+--   sec:Destroy()                      -- some com a seção e seus componentes
+--
+-- Altura é calculada pelo UIListLayout + AutomaticSize: nada de números
+-- mágicos por componente.
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Section"] = function(Env)
+	local U = Env.Util
+
+	local Section = {}
+	Section.__index = Section
+
+	function Section.new(tab, config)
+		config = config or {}
+		local palette = Env.Theme:Get()
+
+		local self = setmetatable({
+			Name = config.Name or "",
+			Description = config.Description,
+			Tab = tab,
+			Window = tab.Window,
+			_Title = config.Name or "",
+			_Items = {},
+			_Order = 0,
+			Maid = Env.Maid.new(),
+			Destroyed = false,
+		}, Section)
+
+		local card = U.New("Frame", {
+			Name = "Section_" .. tostring(self.Name ~= "" and self.Name or "semTitulo"),
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundColor3 = palette.Card,
+			BorderSizePixel = 0,
+			ClipsDescendants = false,
+			Parent = tab:_ColumnFor(config.Column),
+		})
+		U.Corner(card, 10)
+		local stroke = U.Stroke(card, palette.Border, 1, 0.35)
+		local padding = U.Padding(card, 12, 12, 12, 12)
+		-- empilha cabeçalho/espaçador/conteúdo; sem isto tudo cai em (0,0)
+		U.List(card, {Padding = 0})
+		self.Frame = card
+		self.Stroke = stroke
+
+		-- seção implícita (atalhos tab:CreateX) vira lista "nua": sem cartão,
+		-- sem borda e sem padding — os componentes caem direto na coluna.
+		local bare = (self.Name == "" and (self.Description == nil or self.Description == ""))
+		if bare then
+			card.BackgroundTransparency = 1
+			stroke.Transparency = 1
+			padding.PaddingTop = UDim.new(0, 0)
+			padding.PaddingBottom = UDim.new(0, 0)
+			padding.PaddingLeft = UDim.new(0, 0)
+			padding.PaddingRight = UDim.new(0, 0)
+		end
+		self.Bare = bare
+
+		local header = nil
+		if self.Name ~= "" or (self.Description and self.Description ~= "") then
+			header = U.New("Frame", {
+				Size = UDim2.new(1, 0, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				Parent = card,
+			})
+			U.List(header, {Padding = 2})
+
+			header.LayoutOrder = 1
+			if self.Name ~= "" then
+				local title = U.Label(header, self.Name, {
+					Font = Enum.Font.GothamBold, Size = 13, Color = palette.Text,
+				})
+				title.Size = UDim2.new(1, 0, 0, 18)
+				self.TitleLabel = title
+			end
+			if self.Description and self.Description ~= "" then
+				local desc = U.Label(header, self.Description, {
+					Font = Enum.Font.Gotham, Size = 10, Color = palette.Muted, Wrap = true,
+					Truncate = Enum.TextTruncate.None,
+				})
+				desc.Size = UDim2.new(1, 0, 0, 0)
+				desc.AutomaticSize = Enum.AutomaticSize.Y
+				self.DescLabel = desc
+			end
+		end
+
+		local content = U.New("Frame", {
+			Name = "Content",
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Parent = card,
+		})
+		U.List(content, {Padding = 4})
+		self.Content = content
+
+		content.LayoutOrder = 3
+		if header then
+			U.New("Frame", {
+				Size = UDim2.new(1, 0, 0, 6),
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				LayoutOrder = 2,
+				Parent = card,
+			})
+		end
+
+		self.Maid:Add(Env.Theme:OnChanged(function(nextPalette)
+			card.BackgroundColor3 = nextPalette.Card
+			card.BackgroundTransparency = U.Alpha(nextPalette, self.Bare and 1 or 0)
+			stroke.Color = nextPalette.Border
+			if self.TitleLabel then self.TitleLabel.TextColor3 = nextPalette.Text end
+			if self.DescLabel then self.DescLabel.TextColor3 = nextPalette.Muted end
+		end))
+
+		return self
+	end
+
+	-- ── registro interno ───────────────────────────────────────────────
+	function Section:_register(component)
+		self._Order = self._Order + 1
+		component.Row.LayoutOrder = self._Order
+		component.Section = self
+		component.Window = self.Window
+		table.insert(self._Items, component)
+		component.RegistryId = self.Window.Registry:Add(component, {
+			name = component.Name,
+			description = component.Description,
+			kind = component.Type,
+			tab = self.Tab,
+			section = self,
+		})
+		return component
+	end
+
+	function Section:_unregister(component)
+		for index = #self._Items, 1, -1 do
+			if self._Items[index] == component then
+				table.remove(self._Items, index)
+				break
+			end
+		end
+		if component.RegistryId then
+			self.Window.Registry:Remove(component.RegistryId)
+			component.RegistryId = nil
+		end
+	end
+
+	-- ── componentes ────────────────────────────────────────────────────
+	function Section:CreateButton(config)
+		if self.Destroyed then return nil end
+		return Env.Components.Button.new(self, config)
+	end
+
+	function Section:CreateToggle(config)
+		if self.Destroyed then return nil end
+		return Env.Components.Toggle.new(self, config)
+	end
+
+	function Section:CreateSlider(config)
+		if self.Destroyed then return nil end
+		return Env.Components.Slider.new(self, config)
+	end
+
+	function Section:CreateDropdown(config)
+		if self.Destroyed then return nil end
+		return Env.Components.Dropdown.new(self, config)
+	end
+
+	function Section:CreateInput(config)
+		if self.Destroyed then return nil end
+		return Env.Components.Input.new(self, config)
+	end
+
+	function Section:CreateLabel(config)
+		if self.Destroyed then return nil end
+		return Env.Components.Label.new(self, config)
+	end
+
+	function Section:CreateParagraph(config)
+		if self.Destroyed then return nil end
+		return Env.Components.Paragraph.new(self, config)
+	end
+
+	function Section:CreateKeybind(config)
+		if self.Destroyed then return nil end
+		return Env.Components.Keybind.new(self, config)
+	end
+
+	function Section:CreateColorPicker(config)
+		if self.Destroyed then return nil end
+		return Env.Components.ColorPicker.new(self, config)
+	end
+
+	function Section:CreateDivider()
+		if self.Destroyed then return nil end
+		return Env.Components.Divider.new(self, {})
+	end
+
+	-- ── estado ─────────────────────────────────────────────────────────
+	function Section:SetName(name)
+		self.Name = tostring(name or "")
+		self._Title = self.Name
+		if self.TitleLabel then self.TitleLabel.Text = self.Name end
+		return self
+	end
+
+	function Section:GetName()
+		return self.Name
+	end
+
+	function Section:GetComponents()
+		local copy = {}
+		for index, component in ipairs(self._Items) do copy[index] = component end
+		return copy
+	end
+
+	function Section:Destroy()
+		if self.Destroyed then return end
+		self.Destroyed = true
+
+		local items = {}
+		for index, item in ipairs(self._Items) do items[index] = item end
+		for _, item in ipairs(items) do
+			pcall(function() item:Destroy() end)
+		end
+		self._Items = {}
+
+		if self.Tab then self.Tab:_ForgetSection(self) end
+		self.Maid:Clean()
+		if self.Frame then self.Frame:Destroy() end
+		self.Frame = nil
+	end
+
+	return Section
+end
+
+-- ── módulo: Tab (src/Tab.lua) ────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- TAB — página com rolagem própria e seções
+--
+--   local tab = Window:CreateTab({Name = "Principal", Icon = "home"})
+--   local sec = tab:CreateSection({Name = "Geral"})
+--   tab:CreateToggle({...})   -- atalho: usa uma seção implícita "sem cartão"
+--
+-- Cada aba tem seu próprio contêiner; trocar de aba só alterna Visible —
+-- nada é recriado.
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Tab"] = function(Env)
+	local U = Env.Util
+	local Section = Env.Section
+
+	local Tab = {}
+	Tab.__index = Tab
+
+	function Tab.new(window, config)
+		config = config or {}
+		local palette = Env.Theme:Get()
+
+		local self = setmetatable({
+			Name = config.Name or "Aba",
+			Icon = config.Icon,
+			Window = window,
+			Columns = tonumber(config.Columns) or 1,
+			Sections = {},
+			Selected = false,
+			Destroyed = false,
+			Maid = Env.Maid.new(),
+			_DefaultSection = nil,
+		}, Tab)
+
+		-- contêiner da aba dentro da área de conteúdo
+		local page = U.New("Frame", {
+			Name = "Tab_" .. tostring(self.Name),
+			Size = UDim2.new(1, 0, 1, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Visible = false,
+			Parent = window.Content,
+		})
+		self.Page = page
+
+		local scroller = U.New("ScrollingFrame", {
+			Name = "Scroll",
+			Size = UDim2.new(1, 0, 1, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			CanvasSize = UDim2.new(0, 0, 0, 0),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollBarThickness = 4,
+			ScrollBarImageColor3 = palette.AccentSoft,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+			Parent = page,
+		})
+		U.Padding(scroller, 2, 6, 12, 2)
+		self.Scroller = scroller
+
+		local holder = U.New("Frame", {
+			Name = "Holder",
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Parent = scroller,
+		})
+		U.List(holder, {Padding = 10, Horizontal = self.Columns > 1})
+		self.Holder = holder
+
+		self._Columns = {}
+		local columnCount = self.Columns > 1 and 2 or 1
+		for index = 1, columnCount do
+			local width = columnCount == 1 and UDim2.new(1, 0, 0, 0) or UDim2.new(0.5, -5, 0, 0)
+			local column = U.New("Frame", {
+				Name = "Column" .. tostring(index),
+				Size = width,
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				BorderSizePixel = 0,
+				LayoutOrder = index,
+				Parent = holder,
+			})
+			U.List(column, {Padding = 10})
+			self._Columns[index] = column
+		end
+
+		self.Maid:Add(Env.Theme:OnChanged(function(nextPalette)
+			scroller.ScrollBarImageColor3 = nextPalette.AccentSoft
+		end))
+
+		return self
+	end
+
+	function Tab:_ColumnFor(index)
+		if self.Columns <= 1 then return self._Columns[1] end
+		return self._Columns[tonumber(index) == 2 and 2 or 1]
+	end
+
+	function Tab:CreateSection(config)
+		if self.Destroyed then return nil end
+		local section = Section.new(self, config)
+		table.insert(self.Sections, section)
+		return section
+	end
+
+	function Tab:_ForgetSection(section)
+		for index = #self.Sections, 1, -1 do
+			if self.Sections[index] == section then
+				table.remove(self.Sections, index)
+				break
+			end
+		end
+	end
+
+	-- seção implícita para os atalhos tab:CreateToggle(...)
+	function Tab:_EnsureDefaultSection()
+		if self.Destroyed then return nil end
+		if not self._DefaultSection or self._DefaultSection.Destroyed then
+			self._DefaultSection = Section.new(self, {Name = "", Column = 1})
+			table.insert(self.Sections, self._DefaultSection)
+		end
+		return self._DefaultSection
+	end
+
+	function Tab:GetDefaultSection()
+		return self:_EnsureDefaultSection()
+	end
+
+	function Tab:CreateButton(config)
+		local section = self:_EnsureDefaultSection()
+		if not section then return nil end
+		return section:CreateButton(config)
+	end
+	function Tab:CreateToggle(config)
+		local section = self:_EnsureDefaultSection()
+		if not section then return nil end
+		return section:CreateToggle(config)
+	end
+	function Tab:CreateSlider(config)
+		local section = self:_EnsureDefaultSection()
+		if not section then return nil end
+		return section:CreateSlider(config)
+	end
+	function Tab:CreateDropdown(config)
+		local section = self:_EnsureDefaultSection()
+		if not section then return nil end
+		return section:CreateDropdown(config)
+	end
+	function Tab:CreateInput(config)
+		local section = self:_EnsureDefaultSection()
+		if not section then return nil end
+		return section:CreateInput(config)
+	end
+	function Tab:CreateLabel(config)
+		local section = self:_EnsureDefaultSection()
+		if not section then return nil end
+		return section:CreateLabel(config)
+	end
+	function Tab:CreateParagraph(config)
+		local section = self:_EnsureDefaultSection()
+		if not section then return nil end
+		return section:CreateParagraph(config)
+	end
+	function Tab:CreateKeybind(config)
+		local section = self:_EnsureDefaultSection()
+		if not section then return nil end
+		return section:CreateKeybind(config)
+	end
+	function Tab:CreateColorPicker(config)
+		local section = self:_EnsureDefaultSection()
+		if not section then return nil end
+		return section:CreateColorPicker(config)
+	end
+	function Tab:CreateDivider()
+		local section = self:_EnsureDefaultSection()
+		if not section then return nil end
+		return section:CreateDivider()
+	end
+
+	function Tab:SetName(name)
+		self.Name = tostring(name or self.Name)
+		self.Page.Name = "Tab_" .. self.Name
+		if self.Window then self.Window:_RefreshNav() end
+		return self
+	end
+
+	function Tab:Select()
+		if self.Window then self.Window:SelectTab(self) end
+	end
+
+	function Tab:IsSelected()
+		return self.Selected == true
+	end
+
+	function Tab:Show(value)
+		local visible = value ~= false
+		self.Page.Visible = visible
+		self.Selected = visible
+	end
+
+	function Tab:GetComponents()
+		local list = {}
+		for _, section in ipairs(self.Sections) do
+			for _, component in ipairs(section:GetComponents()) do
+				table.insert(list, component)
+			end
+		end
+		return list
+	end
+
+	function Tab:Destroy()
+		if self.Destroyed then return end
+		self.Destroyed = true
+
+		local sections = {}
+		for index, section in ipairs(self.Sections) do sections[index] = section end
+		for _, section in ipairs(sections) do
+			pcall(function() section:Destroy() end)
+		end
+		self.Sections = {}
+
+		if self.Window then self.Window:_ForgetTab(self) end
+		self.Maid:Clean()
+		if self.Page then self.Page:Destroy() end
+		self.Page = nil
+	end
+
+	return Tab
+end
+
+-- ── módulo: Window (src/Window.lua) ──────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- WINDOW — a janela principal
+--
+--   local window = Expander:CreateWindow({
+--       Title = "EXPANDER", Subtitle = "Premium Scripts",
+--       Theme = "Purple", Size = UDim2.fromOffset(900, 580),
+--   })
+--
+--   window:CreateTab({Name = "Principal", Icon = "home"})
+--   window:Notify({Title = "Olá", Content = "funcionando", Duration = 3})
+--   window:SetTheme("Midnight") / SetAccent(Color3) / SetTransparency(0.1)
+--   window:Minimize(true) / window:Destroy()
+--   window:Search("farm")  --> lista de componentes encontrados
+--   window:SelectTab(tab)  --> troca de aba
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Window"] = function(Env)
+	local U = Env.Util
+	local Tab = Env.Tab
+
+	local Window = {}
+	Window.__index = Window
+	Window.__typename = "Window"
+
+	local PAD = 14
+	local HEADER = 64
+	local SIDEBAR = 196
+
+	-- ── container da GUI: gethui → PlayerGui → CoreGui ────────────────
+	local function findParent()
+		local function probe(container)
+			if not container then return false end
+			return pcall(function()
+				local test = Instance.new("ScreenGui")
+				test.Name = "_ExpanderProbe"
+				test.Parent = container
+				test:Destroy()
+			end)
+		end
+
+		local okHui, hui = pcall(function()
+			if type(gethui) == "function" then return gethui() end
+			return nil
+		end)
+		if okHui and hui and probe(hui) then return hui, "gethui" end
+
+		local players = game:GetService("Players")
+		local localPlayer = players.LocalPlayer
+		if localPlayer then
+			local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+			if not playerGui then
+				local okWait, waited = pcall(function() return localPlayer:WaitForChild("PlayerGui", 5) end)
+				if okWait then playerGui = waited end
+			end
+			if playerGui and probe(playerGui) then return playerGui, "PlayerGui" end
+		end
+
+		local okCore, core = pcall(function() return game:GetService("CoreGui") end)
+		if okCore and core and probe(core) then return core, "CoreGui" end
+
+		-- servidor: qualquer PlayerGui existente serve (GUI replicada)
+		local playersList = players:GetPlayers()
+		for _, candidate in ipairs(playersList) do
+			local gui = candidate:FindFirstChildOfClass("PlayerGui")
+			if gui and probe(gui) then return gui, "PlayerGui(" .. candidate.Name .. ")" end
+		end
+
+		return nil, nil
+	end
+
+	local function sanitize(text)
+		return (tostring(text or "Window"):gsub("[^%w_%- ]", ""))
+	end
+
+	function Window.new(options)
+		options = options or {}
+		local palette = Env.Theme:Get()
+
+		-- aceita UDim2, {largura, altura} ou {Width =, Height =} em pixels
+		local size = options.Size
+		if type(size) == "table" then
+			local width = tonumber(size[1] or size.Width or (type(size.X) == "number" and size.X))
+			local height = tonumber(size[2] or size.Height or (type(size.Y) == "number" and size.Y))
+			if width and height then
+				size = UDim2.fromOffset(width, height)
+			end
+		end
+
+		local self = setmetatable({
+			Title = options.Title or "EXPANDER",
+			Subtitle = options.Subtitle or "",
+			Size = size or UDim2.fromOffset(900, 580),
+			Tabs = {},
+			SelectedTab = nil,
+			Minimized = false,
+			Destroyed = false,
+			Maid = Env.Maid.new(),
+			Registry = Env.Registry.new(),
+			OnCloseCallback = options.OnClose,
+			_CloseCallbackSet = type(options.OnClose) == "function",
+			_Order = 0,
+		}, Window)
+
+		self.Width = math.max(self.Size.X.Offset, 640)
+		self.Height = math.max(self.Size.Y.Offset, 220)
+
+		local parent, parentName = findParent()
+		if not parent then
+			error("nenhum container de GUI acessível (gethui, PlayerGui, CoreGui)")
+		end
+		self.ParentName = parentName
+
+		local guiName = "ExpanderUI_" .. sanitize(self.Title)
+		self.GuiName = guiName
+
+		self.ScreenGui = U.New("ScreenGui", {
+			Name = guiName,
+			ResetOnSpawn = false,
+			IgnoreGuiInset = true,
+			DisplayOrder = options.DisplayOrder or 999,
+			ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+			Parent = parent,
+		})
+		self.Maid:Add(self.ScreenGui)
+
+		-- ── raiz ───────────────────────────────────────────────────────
+		local root = U.New("Frame", {
+			Name = "Root",
+			Size = UDim2.fromOffset(self.Width, self.Height),
+			Position = UDim2.fromScale(0.5, 0.5),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			BackgroundColor3 = palette.Bg,
+			BorderSizePixel = 0,
+			ClipsDescendants = true,
+			Parent = self.ScreenGui,
+		})
+		U.Corner(root, 14)
+		local rootStroke = U.Stroke(root, palette.AccentSoft, 1, 0.55)
+		self.Root = root
+		self.RootStroke = rootStroke
+		self.Scale = U.New("UIScale", {Scale = 1, Parent = root})
+
+		-- ── cabeçalho ──────────────────────────────────────────────────
+		local header = U.New("Frame", {
+			Name = "Header",
+			Size = UDim2.new(1, 0, 0, HEADER),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ClipsDescendants = true,
+			Parent = root,
+		})
+		self.Header = header
+
+		local divider = U.New("Frame", {
+			Size = UDim2.new(1, 0, 0, 1),
+			Position = UDim2.new(0, 0, 0, HEADER),
+			BackgroundColor3 = palette.Border,
+			BorderSizePixel = 0,
+			Parent = root,
+		})
+		self.HeaderDivider = divider
+
+		-- marca desenhada (três barras inclinadas)
+		local mark = U.New("Frame", {
+			Size = UDim2.fromOffset(34, 30),
+			Position = UDim2.fromOffset(18, 17),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ClipsDescendants = true,
+			Parent = header,
+		})
+		self._MarkBars = {}
+		for index = 1, 3 do
+			local bar = U.New("Frame", {
+				Size = UDim2.fromOffset(30, 6),
+				Position = UDim2.fromOffset(-2 + index * 3, 4 + index * 7),
+				BackgroundColor3 = palette.AccentGlow,
+				BorderSizePixel = 0,
+				Rotation = -20,
+				Parent = mark,
+			})
+			table.insert(self._MarkBars, bar)
+		end
+
+		local title = U.Label(header, self.Title, {
+			Font = Enum.Font.GothamBlack, Size = 18, Color = palette.Text,
+		})
+		title.Size = UDim2.fromOffset(220, 22)
+		title.Position = UDim2.fromOffset(62, 13)
+		self.TitleLabel = title
+
+		local subtitle = U.Label(header, self.Subtitle, {
+			Font = Enum.Font.GothamMedium, Size = 9, Color = palette.Muted,
+		})
+		subtitle.Size = UDim2.fromOffset(220, 14)
+		subtitle.Position = UDim2.fromOffset(63, 34)
+		self.SubtitleLabel = subtitle
+
+		-- ── botões do cabeçalho ───────────────────────────────────────
+		local function headerButton(iconName, x, tooltip)
+			local button = U.New("TextButton", {
+				Size = UDim2.fromOffset(30, 30),
+				Position = UDim2.fromOffset(x, 17),
+				BackgroundColor3 = palette.Card,
+				BorderSizePixel = 0,
+				AutoButtonColor = false,
+				Text = "",
+				Parent = header,
+			})
+			U.Corner(button, 8)
+			U.Stroke(button, palette.Border, 1, 0.1)
+			local icon = Env.Icons(iconName, palette.Dim, 14)
+			icon.Position = UDim2.new(0.5, -7, 0.5, -7)
+			icon.Parent = button
+			self.Maid:Add(button.MouseEnter:Connect(function()
+				U.Tween(button, 0.12, {BackgroundColor3 = palette.CardHover})
+			end))
+			self.Maid:Add(button.MouseLeave:Connect(function()
+				U.Tween(button, 0.12, {BackgroundColor3 = palette.Card})
+			end))
+			return button, icon
+		end
+
+		local closeButton = headerButton("close", self.Width - 18 - 30)
+		local minimizeButton = headerButton("minus", self.Width - 18 - 30 - 38)
+		local themeButton = headerButton("gear", self.Width - 18 - 30 - 76)
+		self.CloseButton = closeButton
+		self.MinimizeButton = minimizeButton
+		self.ThemeButton = themeButton
+
+		-- ── busca ─────────────────────────────────────────────────────
+		local searchBox = U.New("Frame", {
+			Size = UDim2.fromOffset(210, 30),
+			Position = UDim2.fromOffset(self.Width - 18 - 30 - 76 - 24 - 210, 17),
+			BackgroundColor3 = palette.Card,
+			BorderSizePixel = 0,
+			Parent = header,
+		})
+		U.Corner(searchBox, 8)
+		local searchStroke = U.Stroke(searchBox, palette.Border, 1, 0.1)
+		self.SearchBox = searchBox
+
+		local searchIcon = Env.Icons("search", palette.Muted, 12)
+		searchIcon.Position = UDim2.fromOffset(9, 9)
+		searchIcon.Parent = searchBox
+
+		local searchInput = U.New("TextBox", {
+			Size = UDim2.new(1, -34, 1, 0),
+			Position = UDim2.fromOffset(28, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Font = Enum.Font.Gotham,
+			TextSize = 11,
+			TextColor3 = palette.Text,
+			PlaceholderText = "buscar controle...",
+			PlaceholderColor3 = palette.Muted,
+			Text = "",
+			TextXAlignment = Enum.TextXAlignment.Left,
+			ClearTextOnFocus = false,
+			Parent = searchBox,
+		})
+		self.SearchInput = searchInput
+
+		-- ── barra lateral ─────────────────────────────────────────────
+		local sidebar = U.New("ScrollingFrame", {
+			Name = "Sidebar",
+			Size = UDim2.fromOffset(SIDEBAR, self.Height - HEADER - PAD),
+			Position = UDim2.fromOffset(PAD, HEADER + 2),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			CanvasSize = UDim2.new(0, 0, 0, 0),
+			AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollBarThickness = 2,
+			ScrollBarImageColor3 = palette.Border,
+			ScrollingDirection = Enum.ScrollingDirection.Y,
+			Parent = root,
+		})
+		U.List(sidebar, {Padding = 4})
+		self.Sidebar = sidebar
+
+		-- ── conteúdo ──────────────────────────────────────────────────
+		local contentX = PAD + SIDEBAR + 12
+		local content = U.New("Frame", {
+			Name = "Content",
+			Size = UDim2.new(1, -(contentX + PAD), 1, -(HEADER + PAD + 2)),
+			Position = UDim2.fromOffset(contentX, HEADER + 2),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ClipsDescendants = true,
+			Parent = root,
+		})
+		self.Content = content
+
+		-- ── overlay (dropdowns, busca) ────────────────────────────────
+		local overlay = U.New("Frame", {
+			Name = "Overlay",
+			Size = UDim2.fromScale(1, 1),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			Visible = true,
+			ZIndex = 500,
+			Parent = root,
+		})
+		self.Overlay = overlay
+
+		-- ── notificações ──────────────────────────────────────────────
+		self.NotificationLayer = U.New("Frame", {
+			Name = "NotificationLayer",
+			Size = UDim2.new(1, 0, 1, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			ZIndex = 700,
+			Parent = root,
+		})
+		self.Notifier = Env.Notifications.new(self.NotificationLayer, math.min(300, math.floor(self.Width * 0.36)))
+
+		-- ── arrastar ──────────────────────────────────────────────────
+		local dragArea = U.New("TextButton", {
+			Name = "DragArea",
+			Size = UDim2.new(1, -420, 1, 0),
+			Position = UDim2.fromOffset(0, 0),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Text = "",
+			ZIndex = 3,
+			Parent = header,
+		})
+		self.DragArea = dragArea
+
+		local drag = {active = false, startX = 0, startY = 0, startPos = nil}
+		self.Maid:Add(dragArea.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				drag.active = true
+				drag.startX = input.Position.X
+				drag.startY = input.Position.Y
+				drag.startPos = root.Position
+			end
+		end))
+		if U.UserInput then
+			self.Maid:Add(U.UserInput.InputChanged:Connect(function(input)
+				if not drag.active or not drag.startPos then return end
+				if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+					root.Position = UDim2.new(
+						drag.startPos.X.Scale, drag.startPos.X.Offset + (input.Position.X - drag.startX),
+						drag.startPos.Y.Scale, drag.startPos.Y.Offset + (input.Position.Y - drag.startY)
+					)
+				end
+			end))
+			self.Maid:Add(U.UserInput.InputEnded:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+					drag.active = false
+				end
+			end))
+		end
+
+		-- ── ações fixas ───────────────────────────────────────────────
+		self.Maid:Add(closeButton.MouseButton1Click:Connect(function() self:Destroy() end))
+		self.Maid:Add(minimizeButton.MouseButton1Click:Connect(function() self:Minimize(not self.Minimized) end))
+		self.Maid:Add(themeButton.MouseButton1Click:Connect(function() self:CycleTheme() end))
+
+		self.Maid:Add(searchInput:GetPropertyChangedSignal("Text"):Connect(function()
+			self:_UpdateSearch(searchInput.Text)
+		end))
+		self.Maid:Add(searchInput.Focused:Connect(function()
+			searchStroke.Color = Env.Theme:Get().Accent
+		end))
+		self.Maid:Add(searchInput.FocusLost:Connect(function()
+			searchStroke.Color = Env.Theme:Get().Border
+		end))
+
+		-- tema: repinta o "chrome" da janela
+		self.Maid:Add(Env.Theme:OnChanged(function(nextPalette)
+			root.BackgroundColor3 = nextPalette.Bg
+			root.BackgroundTransparency = U.Alpha(nextPalette, 0)
+			rootStroke.Color = nextPalette.AccentSoft
+			divider.BackgroundColor3 = nextPalette.Border
+			title.TextColor3 = nextPalette.Text
+			subtitle.TextColor3 = nextPalette.Muted
+			searchBox.BackgroundColor3 = nextPalette.Card
+			searchStroke.Color = nextPalette.Border
+			searchInput.TextColor3 = nextPalette.Text
+			searchInput.PlaceholderColor3 = nextPalette.Muted
+			sidebar.ScrollBarImageColor3 = nextPalette.Border
+			for _, bar in ipairs(self._MarkBars) do bar.BackgroundColor3 = nextPalette.AccentGlow end
+			self:_PaintNav(nextPalette)
+		end))
+
+		self:_LayoutChrome()
+		self:_ApplyScale()
+		self:_PaintNav(Env.Theme:Get())
+
+		self.Maid:Add((function()
+			local camera = workspace.CurrentCamera
+			if not camera then return {Disconnect = function() end} end
+			return camera:GetPropertyChangedSignal("ViewportSize"):Connect(function() self:_ApplyScale() end)
+		end)())
+
+		return self
+	end
+
+	-- ── escala responsiva ─────────────────────────────────────────────
+	function Window:ViewportSize()
+		local camera = workspace.CurrentCamera
+		if camera then return camera.ViewportSize end
+		return Vector2.new(1280, 720)
+	end
+
+	function Window:_ApplyScale()
+		local viewport = self:ViewportSize()
+		local fit = math.min(
+			(viewport.X - 24) / self.Width,
+			(viewport.Y - 24) / (self.Minimized and HEADER or self.Height)
+		)
+		self.Scale.Scale = U.Clamp(fit, 0.4, 1)
+	end
+
+	-- reposiciona o "chrome" do cabeçalho e as colunas quando o tamanho muda
+	function Window:_LayoutChrome()
+		local width, height = self.Width, self.Height
+		if self.Root then self.Root.Size = UDim2.fromOffset(width, height) end
+		if self.CloseButton then self.CloseButton.Position = UDim2.fromOffset(width - 48, 17) end
+		if self.MinimizeButton then self.MinimizeButton.Position = UDim2.fromOffset(width - 86, 17) end
+		if self.ThemeButton then self.ThemeButton.Position = UDim2.fromOffset(width - 124, 17) end
+		if self.SearchBox then self.SearchBox.Position = UDim2.fromOffset(width - 358, 17) end
+		if self.Sidebar then self.Sidebar.Size = UDim2.fromOffset(SIDEBAR, height - HEADER - PAD) end
+		if self.Content then
+			self.Content.Size = UDim2.new(1, -((PAD + SIDEBAR + 12) + PAD), 1, -(HEADER + PAD + 2))
+		end
+	end
+
+	function Window:GetScale()
+		local value = (self.Scale and self.Scale.Scale) or 1
+		if type(value) ~= "number" or value <= 0 then return 1 end
+		return value
+	end
+
+	-- converte uma posição absoluta (tela) para o espaço interno do Overlay,
+	-- que vive dentro do Root escalado — por isso a divisão pela escala.
+	function Window:ToOverlaySpace(absPosition)
+		local origin = self.Overlay.AbsolutePosition
+		local scaleValue = self:GetScale()
+		return Vector2.new(
+			((absPosition.X or 0) - origin.X) / scaleValue,
+			((absPosition.Y or 0) - origin.Y) / scaleValue
+		)
+	end
+
+	function Window:OverlayHeight()
+		return self.Overlay.AbsoluteSize.Y / self:GetScale()
+	end
+
+	-- ── navegação ─────────────────────────────────────────────────────
+	function Window:_CreateNavButton(tab)
+		local palette = Env.Theme:Get()
+		local button = U.New("TextButton", {
+			Name = "Nav_" .. tostring(tab.Name),
+			Size = UDim2.fromOffset(SIDEBAR, 42),
+			BackgroundColor3 = palette.Card,
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+			AutoButtonColor = false,
+			Text = "",
+			Parent = self.Sidebar,
+		})
+		U.Corner(button, 8)
+
+		local gradient = U.New("UIGradient", {
+			Color = ColorSequence.new(palette.Accent, palette.AccentDeep),
+			Enabled = false,
+			Parent = button,
+		})
+
+		local glyph = Env.Icons(tab.Icon or "dot", palette.Muted, 16)
+		glyph.Position = UDim2.fromOffset(13, 13)
+		glyph.Parent = button
+
+		local label = U.Label(button, tab.Name, {
+			Font = Enum.Font.GothamMedium, Size = 12, Color = palette.Dim,
+		})
+		label.Size = UDim2.new(1, -50, 1, 0)
+		label.Position = UDim2.fromOffset(40, 0)
+
+		local entry = {
+			Tab = tab,
+			Button = button,
+			Label = label,
+			Icon = glyph,
+			Gradient = gradient,
+			Active = false,
+		}
+		tab._Nav = entry
+
+		self.Maid:Add(button.MouseButton1Click:Connect(function()
+			self:SelectTab(tab)
+		end))
+		self.Maid:Add(button.MouseEnter:Connect(function()
+			if not entry.Active then
+				U.Tween(button, 0.1, {BackgroundTransparency = 0.55})
+			end
+		end))
+		self.Maid:Add(button.MouseLeave:Connect(function()
+			if not entry.Active then
+				U.Tween(button, 0.1, {BackgroundTransparency = 1})
+			end
+		end))
+
+		return entry
+	end
+
+	local function paintGlyph(holder, color)
+		for _, part in ipairs(holder:GetChildren()) do
+			if part:IsA("Frame") then
+				if part.BackgroundTransparency == 1 then
+					for _, child in ipairs(part:GetChildren()) do
+						if child:IsA("UIStroke") then child.Color = color end
+					end
+				else
+					part.BackgroundColor3 = color
+				end
+			end
+		end
+	end
+
+	function Window:_PaintNav(palette)
+		for _, tab in ipairs(self.Tabs) do
+			local entry = tab._Nav
+			if entry then
+				local active = self.SelectedTab == tab
+				entry.Active = active
+				entry.Button.BackgroundColor3 = active and palette.AccentDeep or palette.Card
+				entry.Button.BackgroundTransparency = active and 0 or 1
+				entry.Gradient.Color = ColorSequence.new(palette.Accent, palette.AccentDeep)
+				entry.Gradient.Enabled = active
+				entry.Label.TextColor3 = active and palette.Text or palette.Dim
+				entry.Label.Font = active and Enum.Font.GothamBold or Enum.Font.GothamMedium
+				paintGlyph(entry.Icon, active and palette.Text or palette.Muted)
+			end
+		end
+	end
+
+	function Window:_RefreshNav()
+		for _, tab in ipairs(self.Tabs) do
+			local entry = tab._Nav
+			if entry then
+				entry.Label.Text = tab.Name
+				entry.Button.Name = "Nav_" .. tostring(tab.Name)
+			end
+		end
+	end
+
+	function Window:CreateTab(config)
+		config = config or {}
+		if self.Destroyed then return nil end
+		self._Order = self._Order + 1
+
+		local tab = Tab.new(self, config)
+		table.insert(self.Tabs, tab)
+		self:_CreateNavButton(tab)
+		self:_PaintNav(Env.Theme:Get())
+
+		-- primeira aba já selecionada (sem exigir clique)
+		if not self.SelectedTab then
+			self:SelectTab(tab)
+		end
+		return tab
+	end
+
+	function Window:SelectTab(tab)
+		if type(tab) == "string" then
+			for _, candidate in ipairs(self.Tabs) do
+				if candidate.Name == tab then tab = candidate break end
+			end
+		end
+		if not tab or tab.Destroyed then return false end
+
+		for _, candidate in ipairs(self.Tabs) do
+			local selected = candidate == tab
+			candidate.Page.Visible = selected
+			candidate.Selected = selected
+		end
+		self.SelectedTab = tab
+		self:_PaintNav(Env.Theme:Get())
+		return true
+	end
+
+	function Window:GetTab(name)
+		for _, tab in ipairs(self.Tabs) do
+			if tab.Name == name then return tab end
+		end
+		return nil
+	end
+
+	function Window:GetTabs()
+		local copy = {}
+		for index, tab in ipairs(self.Tabs) do copy[index] = tab end
+		return copy
+	end
+
+	function Window:_ForgetTab(tab)
+		for index = #self.Tabs, 1, -1 do
+			if self.Tabs[index] == tab then table.remove(self.Tabs, index) break end
+		end
+		if tab._Nav then
+			tab._Nav.Button:Destroy()
+			tab._Nav = nil
+		end
+		if self.SelectedTab == tab then
+			self.SelectedTab = nil
+			local nextTab = self.Tabs[1]
+			if nextTab then self:SelectTab(nextTab) end
+		end
+		self:_PaintNav(Env.Theme:Get())
+	end
+
+	-- ── tema ──────────────────────────────────────────────────────────
+	function Window:SetTheme(name)
+		return Env.Theme:Set(name)
+	end
+
+	function Window:CycleTheme()
+		local names = Env.Theme:Names()
+		local current = Env.Theme:Name()
+		local index = 1
+		for i, name in ipairs(names) do
+			if name == current then index = i break end
+		end
+		local nextName = names[(index % #names) + 1]
+		Env.Theme:Set(nextName)
+		self:Notify({Title = "Tema", Content = nextName, Duration = 1.6, Type = "info"})
+	end
+
+	function Window:SetAccent(color)
+		return Env.Theme:SetAccent(color)
+	end
+
+	function Window:SetTransparency(value)
+		Env.Theme:SetTransparency(value)
+	end
+
+	function Window:SetAnimSpeed(value)
+		Env.Theme:SetAnimSpeed(value)
+	end
+
+	-- ── notificações ──────────────────────────────────────────────────
+	function Window:Notify(config)
+		return self.Notifier:Push(config)
+	end
+
+	-- ── minimizar ─────────────────────────────────────────────────────
+	function Window:Minimize(value)
+		value = value == true
+		if self.Minimized == value then return end
+		self.Minimized = value
+
+		if value then
+			U.Tween(self.Root, 0.18, {Size = UDim2.fromOffset(self.Width, HEADER)})
+		else
+			U.Tween(self.Root, 0.18, {Size = UDim2.fromOffset(self.Width, self.Height)})
+		end
+		self.Sidebar.Visible = not value
+		self.Content.Visible = not value
+		self:_ApplyScale()
+	end
+
+	function Window:IsMinimized()
+		return self.Minimized
+	end
+
+	function Window:SetSize(size)
+		if type(size) == "table" then
+			local width = tonumber(size[1] or size.Width)
+			local height = tonumber(size[2] or size.Height)
+			if width and height then size = UDim2.fromOffset(width, height) end
+		end
+		local okW, widthValue = pcall(function() return size.X.Offset end)
+		local okH, heightValue = pcall(function() return size.Y.Offset end)
+		if not okW or not okH or type(widthValue) ~= "number" or type(heightValue) ~= "number" then
+			return false
+		end
+		self.Size = size
+		self.Width = math.max(size.X.Offset, 640)
+		self.Height = math.max(size.Y.Offset, 220)
+		self:_LayoutChrome()
+		self:_ApplyScale()
+		return true
+	end
+
+	function Window:OnClose(fn)
+		self.OnCloseCallback = fn
+		self._CloseCallbackSet = type(fn) == "function"
+	end
+
+	-- ── busca ─────────────────────────────────────────────────────────
+	function Window:Search(query)
+		return self.Registry:Search(query, 30)
+	end
+
+	function Window:_HideSearchResults()
+		if self._SearchPanel then
+			self._SearchPanel:Destroy()
+			self._SearchPanel = nil
+		end
+	end
+
+	function Window:_Flash(component)
+		local row = component and component.Row
+		if not row then return end
+		local palette = Env.Theme:Get()
+		U.Tween(row, 0.12, {BackgroundTransparency = 0, BackgroundColor3 = palette.AccentSoft})
+		U.Delay(0.45, function()
+			if row and row.Parent then
+				U.Tween(row, 0.25, {BackgroundTransparency = 1})
+			end
+		end)
+	end
+
+	function Window:_UpdateSearch(text)
+		self:_HideSearchResults()
+		text = tostring(text or "")
+		if text == "" then return end
+
+		local results = self:Search(text)
+		if #results == 0 then return end
+
+		local palette = Env.Theme:Get()
+		local panel = U.New("Frame", {
+			Name = "SearchResults",
+			Size = UDim2.fromOffset(260, math.min(#results, 6) * 34 + 8),
+			Position = (function()
+				local space = self:ToOverlaySpace(self.SearchBox.AbsolutePosition)
+				return UDim2.fromOffset(space.X, space.Y + 36)
+			end)(),
+			BackgroundColor3 = palette.Panel,
+			BackgroundTransparency = U.Alpha(palette, 0),
+			BorderSizePixel = 0,
+			ClipsDescendants = true,
+			ZIndex = 900,
+			Parent = self.Overlay,
+		})
+		U.Corner(panel, 8)
+		U.Stroke(panel, palette.Border, 1, 0)
+		self._SearchPanel = panel
+
+		for index, entry in ipairs(results) do
+			if index > 6 then break end
+			local button = U.New("TextButton", {
+				Size = UDim2.new(1, -8, 0, 30),
+				Position = UDim2.fromOffset(4, 4 + (index - 1) * 34),
+				BackgroundColor3 = palette.Card,
+				BackgroundTransparency = 0.4,
+				BorderSizePixel = 0,
+				AutoButtonColor = false,
+				Text = "",
+				ZIndex = 901,
+				Parent = panel,
+			})
+			U.Corner(button, 6)
+			local label = U.Label(button, entry.name, {
+				Font = Enum.Font.GothamMedium, Size = 10, Color = palette.Text,
+			})
+			label.Size = UDim2.new(1, -12, 0, 14)
+			label.Position = UDim2.fromOffset(8, 3)
+			local sub = U.Label(button, (entry.tab and entry.tab.Name or "?") .. " · " .. entry.kind, {
+				Font = Enum.Font.Gotham, Size = 8, Color = palette.Muted,
+			})
+			sub.Size = UDim2.new(1, -12, 0, 12)
+			sub.Position = UDim2.fromOffset(8, 16)
+
+			button.MouseButton1Click:Connect(function()
+				if entry.tab then self:SelectTab(entry.tab) end
+				self:_Flash(entry.component)
+				self.SearchInput.Text = ""
+				self:_HideSearchResults()
+			end)
+		end
+	end
+
+	-- ── destruição ────────────────────────────────────────────────────
+	function Window:Destroy()
+		if self.Destroyed then return end
+		self.Destroyed = true
+
+		if type(self.ExpanderUnregister) == "function" then
+			pcall(self.ExpanderUnregister)
+		end
+
+		if self._CloseCallbackSet and type(self.OnCloseCallback) == "function" then
+			U.SafeCall("Window.OnClose", self.OnCloseCallback)
+		end
+
+		self:_HideSearchResults()
+
+		local tabs = {}
+		for index, tab in ipairs(self.Tabs) do tabs[index] = tab end
+		for _, tab in ipairs(tabs) do
+			pcall(function() tab:Destroy() end)
+		end
+		self.Tabs = {}
+		self.SelectedTab = nil
+
+		if self.Notifier then
+			pcall(function() self.Notifier:Destroy() end)
+			self.Notifier = nil
+		end
+
+		self.Registry:Clear()
+		self.Maid:Clean()
+	end
+
+	Window.Close = Window.Destroy
+
+	return Window
+end
+
+-- ── módulo: Core (src/Core.lua) ──────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════════════
+-- CORE — monta a biblioteca a partir dos módulos e expõe a API pública
+--
+-- Recebe a tabela MODULES (nome -> função(Env)) e devolve a Expander.
+-- O build (tools/build.py) preenche MODULES; em Studio usa-se o arquivo
+-- final como ModuleScript (os módulos ficam embutidos).
+-- ═══════════════════════════════════════════════════════════════════════
+MODULES["Core"] = function(MODULES)
+	local Env = {
+		Version = "1.0.0",
+		Name = "ExpanderUI",
+		Components = {},
+		Defaults = {
+			Theme = "Purple",
+			Size = nil, -- UDim2.fromOffset(900, 580) montado abaixo
+		},
+	}
+
+	-- ── utilidades base ───────────────────────────────────────────────
+	Env.Signal = MODULES.Signal(Env)
+	Env.Maid = MODULES.Maid(Env)
+	Env.Util = MODULES.Layout(Env)
+	Env.ThemeClass = MODULES.ThemeManager(Env)
+	Env.Theme = Env.ThemeClass.new(Env.Defaults.Theme or "Purple")
+	Env.Util.AnimSpeed = Env.Theme.AnimSpeed
+	Env.StateClass = MODULES.StateManager(Env)
+	Env.State = Env.StateClass.new()
+	Env.Registry = MODULES.ComponentRegistry(Env)
+	Env.Icons = MODULES.Icons(Env)
+
+	-- ── componentes ───────────────────────────────────────────────────
+	Env.Components.Support = MODULES.Support(Env)
+
+	local COMPONENT_MODULES = {
+		"Button", "Toggle", "Slider", "Dropdown", "Input",
+		"Label", "Paragraph", "Keybind", "ColorPicker", "Divider",
+	}
+	for _, name in ipairs(COMPONENT_MODULES) do
+		Env.Components[name] = MODULES[name](Env)
+	end
+
+	-- ── estrutura ─────────────────────────────────────────────────────
+	Env.Notifications = MODULES.Notifications(Env)
+	Env.Section = MODULES.Section(Env)
+	Env.Tab = MODULES.Tab(Env)
+	Env.Window = MODULES.Window(Env)
+
+	-- ── API pública ───────────────────────────────────────────────────
+	local Expander = {}
+	Expander.Version = Env.Version
+	Expander.Themes = Env.Theme:Names()
+	Expander.Defaults = {Theme = Env.Defaults.Theme}
+
+	local windows = {}
+	local globalState = Env.State
+
+	local function sanitize(text)
+		return (tostring(text or "Window"):gsub("[^%w_%- ]", ""))
+	end
+
+	-- Procura ScreenGuis com o mesmo nome que tenham sobrado de execuções
+	-- anteriores NA MESMA sessão de Roblox (outro script, F5, etc.).
+	local function findStaleGuis(name)
+		local found = {}
+		local function scan(root)
+			if not root then return end
+			pcall(function()
+				for _, child in ipairs(root:GetChildren()) do
+					if child.Name == name and child:IsA("ScreenGui") then
+						table.insert(found, child)
+					end
+				end
+			end)
+		end
+
+		pcall(function()
+			if type(gethui) == "function" then scan(gethui()) end
+		end)
+		pcall(function()
+			local players = game:GetService("Players")
+			local localPlayer = players.LocalPlayer
+			if localPlayer then scan(localPlayer:FindFirstChildOfClass("PlayerGui")) end
+			for _, player in ipairs(players:GetPlayers()) do
+				scan(player:FindFirstChildOfClass("PlayerGui"))
+			end
+		end)
+		pcall(function() scan(game:GetService("CoreGui")) end)
+		return found
+	end
+
+	local function aliveWindows()
+		local alive = {}
+		for _, window in ipairs(windows) do
+			if not window.Destroyed then table.insert(alive, window) end
+		end
+		return alive
+	end
+
+	function Expander:CreateWindow(options)
+		options = options or {}
+
+		-- reutiliza a janela viva com o mesmo título (padrão)
+		if options.Reuse ~= false and options.Title then
+			for _, window in ipairs(aliveWindows()) do
+				if window.Title == options.Title then
+					return window
+				end
+			end
+		end
+
+		-- remove restos de execuções anteriores para não empilhar janelas
+		if options.Replace ~= false and options.Title then
+			local name = "ExpanderUI_" .. sanitize(options.Title)
+			for _, stale in ipairs(findStaleGuis(name)) do
+				pcall(function() stale:Destroy() end)
+			end
+		end
+
+		-- tema pedido nesta janela (sem afetar as outras)
+		if options.Theme and options.Theme ~= Env.Theme:Name() then
+			Env.Theme:Set(options.Theme)
+		end
+		if options.Accent then Env.Theme:SetAccent(options.Accent) end
+		if options.Transparency then Env.Theme:SetTransparency(options.Transparency) end
+		if options.AnimSpeed then Env.Theme:SetAnimSpeed(options.AnimSpeed) end
+
+		local ok, window = pcall(Env.Window.new, options)
+		if not ok then
+			warn("[Expander] falha ao criar janela: " .. tostring(window))
+			return nil, tostring(window)
+		end
+
+		-- permite que a janela se remova da lista ao ser destruída
+		window.ExpanderUnregister = function()
+			for index = #windows, 1, -1 do
+				if windows[index] == window then
+					table.remove(windows, index)
+				end
+			end
+		end
+		table.insert(windows, window)
+		return window
+	end
+
+	function Expander:GetWindow(title)
+		local alive = aliveWindows()
+		if not title then return alive[1] end
+		for _, window in ipairs(alive) do
+			if window.Title == title then return window end
+		end
+		return nil
+	end
+
+	function Expander:GetWindows()
+		return aliveWindows()
+	end
+
+	function Expander:DestroyAll()
+		local alive = aliveWindows()
+		windows = {}
+		for _, window in ipairs(alive) do
+			pcall(function() window:Destroy() end)
+		end
+	end
+
+	function Expander:SetTheme(name)
+		return Env.Theme:Set(name)
+	end
+
+	function Expander:SetAccent(color)
+		return Env.Theme:SetAccent(color)
+	end
+
+	function Expander:SetTransparency(value)
+		Env.Theme:SetTransparency(value)
+	end
+
+	function Expander:SetAnimSpeed(value)
+		Env.Theme:SetAnimSpeed(value)
+	end
+
+	function Expander:GetTheme()
+		return Env.Theme:Name()
+	end
+
+	function Expander:GetThemePalette()
+		return Env.Theme:Get()
+	end
+
+	function Expander:Notify(config)
+		local window = Expander:GetWindow()
+		if window then return window:Notify(config) end
+		return nil
+	end
+
+	function Expander:GetState()
+		return globalState
+	end
+
+	-- Atalhos úteis para quem não quer guardar a janela inteira
+	Expander.State = globalState
+	Expander.Theme = Env.Theme
+
+	Env.Expander = Expander
+
+	return Expander
+end
+
+-- ── bootstrap ─────────────────────────────────────────────────────────
+local Expander = MODULES.Core(MODULES)
+
+-- auto-verificação: se algum módulo não carregou, o erro é claro em vez de
+-- virar um "nil index" no meio do uso.
+if type(Expander) ~= "table" or type(Expander.CreateWindow) ~= "function" then
+	error("[Expander] build inválido: a API pública não foi montada", 0)
+end
+
+-- No executor, deixa a biblioteca acessível para scripts seguintes da sessão.
+-- (getgenv é específico de executor; em jogo normal esta parte é ignorada.)
+if type(getgenv) == "function" then
+	local ok, env = pcall(getgenv)
+	if ok and type(env) == "table" then
+		env.Expander = Expander
+	end
+end
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- CAMADA B — EXEMPLO EMBUTIDO
+-- Daqui para baixo só existe chamada de API pública: nenhum Instance.new,
+-- nenhum Tween escrito à mão. É o "script de jogo" usando a biblioteca acima.
+-- Para usar só a biblioteca, apague este bloco final.
+-- ═══════════════════════════════════════════════════════════════════════
+ExpanderLibrary = Expander
+local Example = (function()
+-- ═══════════════════════════════════════════════════════════════════════
+-- EXPANDER UI — EXEMPLO DE USO (Camada B: só chama a API pública)
+--
+-- Este arquivo NÃO desenha nada: ele apenas declara janela, abas, seções e
+-- controles, e liga callbacks. Toda a interface vem da biblioteca.
+--
+-- COMO USAR
+--   Studio:
+--     1) ModuleScript "ExpanderUI" com dist/ExpanderUI.lua;
+--     2) este arquivo como Script ao lado dele;
+--     3) rode. O require abaixo encontra o módulo sozinho.
+--
+--   Executor:
+--     1) execute dist/ExpanderUI.lua uma vez (ele publica getgenv().Expander);
+--     2) execute este arquivo. Ele pega a biblioteca de getgenv().Expander.
+--
+-- NENHUMA função de jogo é automatizada aqui: os nomes "Auto Farm" são
+-- apenas rótulos. Nada dispara tiro, teleporte ou farm.
+-- ═══════════════════════════════════════════════════════════════════════
+
+local Example = {}
+
+-- ── carregamento da biblioteca ────────────────────────────────────────
+local function loadLibrary()
+	-- injeção direta (usada pelos testes automatizados)
+	if type(ExpanderLibrary) == "table" and type(ExpanderLibrary.CreateWindow) == "function" then
+		return ExpanderLibrary
+	end
+	-- executor: a biblioteca se registrou em getgenv() quando foi executada
+	if type(getgenv) == "function" then
+		local ok, env = pcall(getgenv)
+		if ok and type(env) == "table" and type(env.Expander) == "table" then
+			return env.Expander
+		end
+	end
+	-- Studio: ModuleScript irmão chamado "ExpanderUI"
+	if script and script.Parent then
+		local module = script.Parent:FindFirstChild("ExpanderUI")
+		if module then
+			local ok, lib = pcall(require, module)
+			if ok and type(lib) == "table" then return lib end
+			warn("[Exemplo] require(ExpanderUI) falhou: " .. tostring(lib))
+		end
+	end
+	return nil
+end
+
+-- ── estado do exemplo ─────────────────────────────────────────────────
+Example.Window = nil
+Example.Tabs = {}
+Example.Controls = {}
+Example.TempSection = nil
+Example.Notifications = 0
+
+local function toast(text, kind)
+	if not Example.Window then return end
+	Example.Window:Notify({
+		Title = "Exemplo",
+		Content = text,
+		Duration = 3,
+		Type = kind or "info",
+	})
+	Example.Notifications = Example.Notifications + 1
+end
+
+-- ── montagem da interface ─────────────────────────────────────────────
+function Example.Start(Expander)
+	if Example.Window then return Example.Window end
+
+	local window = Expander:CreateWindow({
+		Title = "EXPANDER",
+		Subtitle = "exemplo de uso da biblioteca",
+		Theme = "Purple",
+		Size = {900, 580},
+	})
+	Example.Window = window
+
+	-- ── aba Principal ────────────────────────────────────────────────
+	local principal = window:CreateTab({Name = "Principal", Icon = "home"})
+	Example.Tabs.principal = principal
+
+	local geral = principal:CreateSection({
+		Name = "Geral",
+		Description = "controles de exemplo, sem lógica de jogo",
+	})
+
+	local marcadores = geral:CreateToggle({
+		Name = "Mostrar marcadores",
+		Description = "demonstração de toggle com callback",
+		Default = false,
+		Callback = function(value)
+			toast("Marcadores: " .. (value and "ligados" or "desligados"), "info")
+		end,
+	})
+	Example.Controls.marcadores = marcadores
+
+	local distancia = geral:CreateSlider({
+		Name = "Distância máxima",
+		Min = 50, Max = 2000, Default = 300, Step = 10, Suffix = " m",
+		Callback = function(value)
+			if Example.Controls.resumo then
+				Example.Controls.resumo:SetText("Distância configurada: " .. tostring(value) .. " m")
+			end
+		end,
+	})
+	Example.Controls.distancia = distancia
+
+	local modo = geral:CreateDropdown({
+		Name = "Modo de operação",
+		Options = {"Silencioso", "Normal", "Turbo"},
+		Default = "Normal",
+		Callback = function(value)
+			toast("Modo alterado para " .. tostring(value), "success")
+		end,
+	})
+	Example.Controls.modo = modo
+
+	local alvo = geral:CreateInput({
+		Name = "Nome do alvo",
+		Placeholder = "mínimo 3 letras",
+		Default = "",
+		Validate = function(text)
+			if #text > 0 and #text < 3 then
+				return false, "nome curto demais"
+			end
+			return true
+		end,
+		Callback = function(text)
+			toast("Alvo digitado: " .. tostring(text), "info")
+		end,
+	})
+	Example.Controls.alvo = alvo
+
+	local resumo = geral:CreateLabel({Text = "Distância configurada: 300 m"})
+	Example.Controls.resumo = resumo
+
+	-- ── seção de atualizações pelo código ────────────────────────────
+	local codigo = principal:CreateSection({
+		Name = "Controle pelo código",
+		Description = "os mesmos SetValue/GetValue usados pelo seu script",
+	})
+
+	codigo:CreateButton({
+		Name = "Aplicar preset",
+		Description = "muda toggle, slider, dropdown e notifica",
+		Style = "primary",
+		Icon = "bolt",
+		Callback = function()
+			marcadores:SetValue(true)
+			distancia:SetValue(750)
+			modo:SetValue("Turbo", true)
+			alvo:SetValue("alvo-de-teste", true)
+			toast("Preset aplicado pelo código", "success")
+		end,
+	})
+
+	codigo:CreateButton({
+		Name = "Testar tratamento de erro",
+		Description = "o erro é contido; a interface continua viva",
+		Callback = function()
+			error("erro proposital do exemplo")
+		end,
+	})
+
+	codigo:CreateButton({
+		Name = "Criar componente temporário",
+		Description = "cria uma seção nova só deste módulo",
+		Callback = function()
+			if Example.TempSection and not Example.TempSection.Destroyed then
+				toast("O componente temporário já existe", "warn")
+				return
+			end
+			local secao = principal:CreateSection({Name = "Temporária"})
+			secao:CreateToggle({Name = "Só existe até ser destruído", Default = true})
+			secao:CreateParagraph({
+				Title = "Nota",
+				Text = "Este cartão é criado em tempo de execução e some ao destruir a seção.",
+			})
+			Example.TempSection = secao
+			toast("Seção temporária criada", "success")
+		end,
+	})
+
+	codigo:CreateButton({
+		Name = "Destruir temporários",
+		Description = "remove só a seção criada por este exemplo",
+		Callback = function()
+			if Example.TempSection and not Example.TempSection.Destroyed then
+				Example.TempSection:Destroy()
+				Example.TempSection = nil
+				toast("Seção temporária destruída", "warn")
+			else
+				toast("Nada temporário para destruir", "info")
+			end
+		end,
+	})
+
+	-- ── aba de aparência ─────────────────────────────────────────────
+	local aparencia = window:CreateTab({Name = "Aparência", Icon = "diamond"})
+	Example.Tabs.aparencia = aparencia
+
+	local temaSec = aparencia:CreateSection({
+		Name = "Tema",
+		Description = "a troca repinta todos os componentes já criados",
+	})
+
+	temaSec:CreateDropdown({
+		Name = "Paleta",
+		Options = Expander.Themes,
+		Default = Expander:GetTheme(),
+		Callback = function(name)
+			window:SetTheme(name)
+			toast("Tema: " .. tostring(name), "info")
+		end,
+	})
+
+	temaSec:CreateSlider({
+		Name = "Transparência",
+		Min = 0, Max = 0.8, Default = 0, Step = 0.05,
+		Format = function(value)
+			return string.format("%d%%", math.floor(value * 100 + 0.5))
+		end,
+		Callback = function(value)
+			window:SetTransparency(value)
+		end,
+	})
+
+	temaSec:CreateSlider({
+		Name = "Velocidade das animações",
+		Min = 0.5, Max = 3, Default = 1, Step = 0.1,
+		Callback = function(value)
+			window:SetAnimSpeed(value)
+		end,
+	})
+
+	local janelaSec = aparencia:CreateSection({Name = "Janela"})
+	janelaSec:CreateButton({
+		Name = "Minimizar / restaurar",
+		Icon = "minus",
+		Callback = function()
+			window:Minimize(not window:IsMinimized())
+		end,
+	})
+	janelaSec:CreateButton({
+		Name = "Notificação de teste",
+		Description = "info, success e warn",
+		Callback = function()
+			window:Notify({Title = "Pronto", Content = "Notificação disparada pelo exemplo", Duration = 3, Type = "success"})
+			window:Notify({Title = "Atenção", Content = "Segunda notificação em sequência", Duration = 3, Type = "warn"})
+		end,
+	})
+	janelaSec:CreateColorPicker({
+		Name = "Cor de destaque",
+		Default = Color3.fromRGB(106, 61, 245),
+		Callback = function(color)
+			window:SetAccent(color)
+		end,
+	})
+
+	local sobre = aparencia:CreateSection({Name = "Sobre este exemplo"})
+	sobre:CreateParagraph({
+		Title = "Camada B",
+		Text = "Este arquivo só declara abas, seções e callbacks. Nenhum Frame, TextLabel ou Tween é criado aqui: tudo vem da biblioteca.",
+	})
+	sobre:CreateDivider()
+	sobre:CreateLabel({Text = "EXPANDER UI · exemplo executável"})
+
+	-- ── aba Auto Farm (rótulos apenas) ───────────────────────────────
+	local farm = window:CreateTab({Name = "Auto Farm", Icon = "swords", Columns = 2})
+	Example.Tabs.farm = farm
+
+	local frutas = farm:CreateSection({Name = "Frutas", Column = 1})
+	frutas:CreateParagraph({
+		Title = "Sem automação",
+		Text = "Os controles abaixo são apenas interface: nada é executado no jogo. Use-os como ponto de partida para o seu próprio módulo.",
+	})
+	frutas:CreateToggle({Name = "Coletar frutas", Default = false})
+	frutas:CreateToggle({Name = "Guardar no inventário", Default = true})
+	frutas:CreateToggle({Name = "Priorizar raridades", Default = true})
+	frutas:CreateSlider({Name = "Raio de coleta", Min = 10, Max = 300, Default = 80, Step = 5, Suffix = " m"})
+	frutas:CreateDropdown({Name = "Raridade mínima", Options = {"Comum", "Rara", "Épica", "Lendária"}, Default = "Rara"})
+
+	local configFarm = farm:CreateSection({Name = "Configurações", Column = 2})
+	configFarm:CreateKeybind({Name = "Atalho do painel", Default = nil})
+	configFarm:CreateColorPicker({Name = "Cor do destaque no mapa", Default = Color3.fromRGB(80, 220, 160)})
+	configFarm:CreateDivider()
+	configFarm:CreateLabel({Text = "Nenhum destes controles está ligado ao jogo."})
+
+	-- ── rodapé de boas-vindas ────────────────────────────────────────
+	window:Notify({
+		Title = "EXPANDER UI",
+		Content = "Exemplo carregado. Troque de aba, altere valores e destrua componentes.",
+		Duration = 4,
+		Type = "success",
+	})
+
+	return window
+end
+
+-- ── encerramento limpo ────────────────────────────────────────────────
+function Example.Destroy()
+	if Example.Window then
+		Example.Window:Destroy()
+	end
+	Example.Window = nil
+	Example.Tabs = {}
+	Example.Controls = {}
+	Example.TempSection = nil
+end
+
+function Example.IsRunning()
+	return Example.Window ~= nil and Example.Window.Destroyed == false
+end
+
+-- ── execução ──────────────────────────────────────────────────────────
+local lib = loadLibrary()
+if lib then
+	local ok, err = pcall(Example.Start, lib)
+	if not ok then
+		warn("[Exemplo] falha ao montar a interface: " .. tostring(err))
+	end
+else
+	warn("[Exemplo] biblioteca não encontrada. Rode dist/ExpanderUI.lua antes (ou ponha o ModuleScript ExpanderUI ao lado).")
+end
+
+return Example
+end)()
+
+-- limpa a ponte usada pelo carregador do exemplo
+ExpanderLibrary = nil
+
+if type(getgenv) == "function" then
+	local ok, env = pcall(getgenv)
+	if ok and type(env) == "table" then
+		env.ExpanderExemplo = Example
+	end
+end
